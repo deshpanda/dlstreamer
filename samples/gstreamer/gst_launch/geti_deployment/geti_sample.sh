@@ -71,6 +71,7 @@ else
   exit
 fi
 
+# Construct the GStreamer pipeline
 PIPELINE="gst-launch-1.0 $SOURCE_ELEMENT $DECODE_ELEMENT \
 $INFERENCE_ELEMENT model=$MODEL_PATH device=$DEVICE pre-process-backend=$PREPROC_BACKEND ! queue ! \
 $SINK_ELEMENT"
