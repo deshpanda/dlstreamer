@@ -1,5 +1,5 @@
 /*******************************************************************************
- * Copyright (C) 2018-2024 Intel Corporation
+ * Copyright (C) 2018-2025 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  ******************************************************************************/
@@ -214,20 +214,34 @@ class VideoFrame {
         if (!gst_buffer_is_writable(buffer))
             throw std::runtime_error("Buffer is not writable.");
 
-        GstVideoRegionOfInterestMeta *meta = gst_buffer_add_video_region_of_interest_meta(
-            buffer, label.c_str(), double_to_uint(_x), double_to_uint(_y), double_to_uint(_w), double_to_uint(_h));
-        meta->id = gst_util_seqnum_next();
-
-        // Add detection tensor
         GstStructure *detection =
             gst_structure_new("detection", "x_min", G_TYPE_DOUBLE, x, "x_max", G_TYPE_DOUBLE, x + w, "y_min",
                               G_TYPE_DOUBLE, y, "y_max", G_TYPE_DOUBLE, y + h, NULL);
+
         if (confidence) {
             gst_structure_set(detection, "confidence", G_TYPE_DOUBLE, confidence, NULL);
         }
+
+        GstAnalyticsRelationMeta *relation_meta = gst_buffer_add_analytics_relation_meta(buffer);
+
+        if (!relation_meta) {
+            throw std::runtime_error("Failed to add GstAnalyticsRelationMeta to buffer");
+        }
+
+        GstAnalyticsODMtd od_mtd;
+        if (!gst_analytics_relation_meta_add_od_mtd(relation_meta, g_quark_from_string(label.c_str()),
+                                                    double_to_int(_x), double_to_int(_y), double_to_int(_w),
+                                                    double_to_int(_h), confidence, &od_mtd)) {
+            throw std::runtime_error("Failed to add detection data to meta");
+        }
+
+        GstVideoRegionOfInterestMeta *meta = gst_buffer_add_video_region_of_interest_meta(
+            buffer, label.c_str(), double_to_uint(_x), double_to_uint(_y), double_to_uint(_w), double_to_uint(_h));
+        meta->id = od_mtd.id;
+
         gst_video_region_of_interest_meta_add_param(meta, detection);
 
-        return RegionOfInterest(meta);
+        return RegionOfInterest(od_mtd, meta);
     }
 
     /**
@@ -311,25 +325,45 @@ class VideoFrame {
         return (val < min) ? min : ((val > max) ? max : static_cast<unsigned int>(val));
     }
 
+    int double_to_int(double val) {
+        int max = std::numeric_limits<int>::max();
+        int min = std::numeric_limits<int>::min();
+        return (val < min) ? min : ((val > max) ? max : static_cast<int>(val));
+    }
+
     std::vector<RegionOfInterest> get_regions() const {
-        std::vector<RegionOfInterest> regions;
-        gpointer state = NULL;
-        GstAnalyticsRelationMeta *relation_meta;
+        GstAnalyticsRelationMeta *relation_meta = gst_buffer_get_analytics_relation_meta(buffer);
 
-        relation_meta = gst_buffer_get_analytics_relation_meta(buffer);
-
-        if (relation_meta) {
-            GstAnalyticsODMtd od_meta;
-            while (gst_analytics_relation_meta_iterate(relation_meta, &state, gst_analytics_od_mtd_get_mtd_type(),
-                                                       &od_meta)) {
-                regions.emplace_back(od_meta);
-            }
-            return regions;
+        if (!relation_meta) {
+            return {};
         }
 
-        GstMeta *meta = NULL;
-        while ((meta = gst_buffer_iterate_meta_filtered(buffer, &state, GST_VIDEO_REGION_OF_INTEREST_META_API_TYPE)))
-            regions.emplace_back((GstVideoRegionOfInterestMeta *)meta);
+        // Count regions to pre-allocate vector capacity
+        gpointer state = NULL;
+        GstAnalyticsODMtd od_mtd;
+        size_t count = 0;
+        while (
+            gst_analytics_relation_meta_iterate(relation_meta, &state, gst_analytics_od_mtd_get_mtd_type(), &od_mtd)) {
+            ++count;
+        }
+
+        // Pre-allocate vector to avoid reallocation during emplace_back
+        std::vector<RegionOfInterest> regions;
+        regions.reserve(count);
+
+        // Construct RegionOfInterest objects
+        state = NULL;
+        while (
+            gst_analytics_relation_meta_iterate(relation_meta, &state, gst_analytics_od_mtd_get_mtd_type(), &od_mtd)) {
+            GstVideoRegionOfInterestMeta *roi_meta = gst_buffer_get_video_region_of_interest_meta_id(buffer, od_mtd.id);
+            if (!roi_meta) {
+                throw std::runtime_error(
+                    "GVA::VideoFrame: Failed to get video region of interest meta for object detection metadata");
+            }
+
+            regions.emplace_back(od_mtd, roi_meta);
+        }
+
         return regions;
     }
 

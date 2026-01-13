@@ -1,5 +1,5 @@
 /*******************************************************************************
- * Copyright (C) 2023-2024 Intel Corporation
+ * Copyright (C) 2023-2025 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  ******************************************************************************/
@@ -483,6 +483,7 @@ void gva_inference_init(GvaInference *self) {
 
     // Intialization of private data
     auto *priv_memory = gva_inference_get_instance_private(self);
+    // This won't be converted to shared ptr because of memory placement
     self->impl = new (priv_memory) GvaInferencePrivate(GST_BASE_TRANSFORM(self), gva_inference_parent_class);
 
     // Optional. Set in-place
@@ -658,3 +659,13 @@ void gva_inference_class_init(GvaInferenceClass *klass) {
                                                         "in this element",
                                                         nullptr, param_flags));
 }
+
+static gboolean plugin_init(GstPlugin *plugin) {
+    if (!gst_element_register(plugin, "gvainference", GST_RANK_NONE, gva_inference_get_type()))
+        return FALSE;
+
+    return TRUE;
+}
+
+GST_PLUGIN_DEFINE(GST_VERSION_MAJOR, GST_VERSION_MINOR, gvainference, PRODUCT_FULL_NAME " gvainference element",
+                  plugin_init, PLUGIN_VERSION, PLUGIN_LICENSE, PACKAGE_NAME, GST_PACKAGE_ORIGIN)

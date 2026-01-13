@@ -1,5 +1,5 @@
 /*******************************************************************************
- * Copyright (C) 2024 Intel Corporation
+ * Copyright (C) 2024-2025 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  ******************************************************************************/
@@ -49,13 +49,13 @@ class YOLOv8Converter : public BlobToROIConverter {
         : BlobToROIConverter(std::move(initializer), confidence_threshold, true, iou_threshold) {
     }
 
-    TensorsTable convert(const OutputBlobs &output_blobs) const override;
+    TensorsTable convert(const OutputBlobs &output_blobs) override;
 
     static std::string getName() {
         return "yolo_v8";
     }
 
-    static std::string getDepricatedName() {
+    static std::string getDeprecatedName() {
         return "tensor_to_bbox_yolo_v8";
     }
 };
@@ -66,10 +66,38 @@ class YOLOv8ObbConverter : public YOLOv8Converter {
         : YOLOv8Converter(std::move(initializer), confidence_threshold, iou_threshold) {
     }
 
-    TensorsTable convert(const OutputBlobs &output_blobs) const override;
+    TensorsTable convert(const OutputBlobs &output_blobs) override;
 
     static std::string getName() {
         return "yolo_v8_obb";
+    }
+};
+
+/*
+yolo_v8_pose object tensor output = [B, 56, N] where:
+    B - batch size
+    N - number of detection boxes
+Detection box has the [x, y, w, h, confidence, keypoint_0_x, keypoint_0_y, keypoint_0_score, ..., ] format, where:
+    (x, y) - raw coordinates of box center
+    (w, h) - raw width and height of box
+    confidence - box detection confidence
+    keypoint (x, y, score) - keypoint coordinate within a box, keypoint detection confidence
+*/
+
+class YOLOv8PoseConverter : public YOLOv8Converter {
+  protected:
+    void parseOutputBlob(const float *data, const std::vector<size_t> &dims,
+                         std::vector<DetectedObject> &objects) const;
+
+  public:
+    YOLOv8PoseConverter(BlobToMetaConverter::Initializer initializer, double confidence_threshold, double iou_threshold)
+        : YOLOv8Converter(std::move(initializer), confidence_threshold, iou_threshold) {
+    }
+
+    TensorsTable convert(const OutputBlobs &output_blobs) override;
+
+    static std::string getName() {
+        return "yolo_v8_pose";
     }
 };
 
@@ -83,7 +111,7 @@ class YOLOv8SegConverter : public YOLOv8Converter {
         : YOLOv8Converter(std::move(initializer), confidence_threshold, iou_threshold) {
     }
 
-    TensorsTable convert(const OutputBlobs &output_blobs) const override;
+    TensorsTable convert(const OutputBlobs &output_blobs) override;
 
     static std::string getName() {
         return "yolo_v8_seg";

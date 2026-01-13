@@ -1,5 +1,5 @@
 /*******************************************************************************
- * Copyright (C) 2022 Intel Corporation
+ * Copyright (C) 2022-2025 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  ******************************************************************************/
@@ -67,12 +67,12 @@ class OpencvFindContours : public BaseTransformInplace {
             findContours(bitmask, contours, RETR_TREE, CHAIN_APPROX_SIMPLE);
             for (auto &contour : contours) {
                 size_t num_points = contour.size();
-                float normalized_points[num_points][2];
+                std::vector<std::vector<float>> normalized_points;
                 for (size_t i = 0; i < num_points; i++) {
                     normalized_points[i][0] = ((float)contour[i].x) / mask_width;
                     normalized_points[i][1] = ((float)contour[i].y) / mask_height;
                 }
-                CPUTensor contour_tensor({{num_points, 2}, DataType::Float32}, *normalized_points);
+                CPUTensor contour_tensor({{num_points, 2}, DataType::Float32}, normalized_points.data());
                 auto contour_meta = add_metadata<InferenceResultMetadata>(*region, _contour_metadata_name);
                 contour_meta.init_tensor_data(contour_tensor, "", contour_format);
             }
@@ -91,8 +91,8 @@ ElementDesc opencv_find_contours = {.name = "opencv_find_contours",
                                     .description = "Find contour points of given mask using opencv",
                                     .author = "Intel Corporation",
                                     .params = &params_desc,
-                                    .input_info = {MediaType::Any},
-                                    .output_info = {MediaType::Any},
+                                    .input_info = MAKE_FRAME_INFO_VECTOR({MediaType::Any}),
+                                    .output_info = MAKE_FRAME_INFO_VECTOR({MediaType::Any}),
                                     .create = create_element<OpencvFindContours>,
                                     .flags = 0};
 }

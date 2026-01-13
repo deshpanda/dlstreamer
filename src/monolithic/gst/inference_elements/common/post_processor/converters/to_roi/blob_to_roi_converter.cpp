@@ -1,5 +1,5 @@
 /*******************************************************************************
- * Copyright (C) 2021-2024 Intel Corporation
+ * Copyright (C) 2021-2025 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  ******************************************************************************/
@@ -9,10 +9,12 @@
 #include "boxes_labels.h"
 #include "boxes_scores.h"
 #include "centerface.h"
+#include "custom_to_roi.h"
 #include "detection_output.h"
 #include "mask_rcnn.h"
 #include "yolo_base.h"
 #include "yolo_v10.h"
+#include "yolo_v11.h"
 #include "yolo_v2.h"
 #include "yolo_v3.h"
 #include "yolo_v4.h"
@@ -35,7 +37,8 @@
 using namespace post_processing;
 
 BlobToMetaConverter::Ptr BlobToROIConverter::create(BlobToMetaConverter::Initializer initializer,
-                                                    const std::string &converter_name) {
+                                                    const std::string &converter_name,
+                                                    const std::string &custom_postproc_lib) {
     auto &model_proc_output_info = initializer.model_proc_output_info;
     if (model_proc_output_info == nullptr)
         throw std::runtime_error("model_proc_output_info have been hot initialized.");
@@ -46,7 +49,10 @@ BlobToMetaConverter::Ptr BlobToROIConverter::create(BlobToMetaConverter::Initial
     double iou_threshold = DEFAULT_IOU_THRESHOLD;
     gst_structure_get_double(model_proc_output_info.get(), "iou_threshold", &iou_threshold);
 
-    if (converter_name == DetectionOutputConverter::getName())
+    if (!custom_postproc_lib.empty())
+        return BlobToMetaConverter::Ptr(
+            new CustomToRoiConverter(std::move(initializer), confidence_threshold, iou_threshold, custom_postproc_lib));
+    else if (converter_name == DetectionOutputConverter::getName())
         return BlobToMetaConverter::Ptr(new DetectionOutputConverter(std::move(initializer), confidence_threshold));
     else if (converter_name == BoxesLabelsConverter::getName())
         return BlobToMetaConverter::Ptr(new BoxesLabelsConverter(std::move(initializer), confidence_threshold));
@@ -60,13 +66,16 @@ BlobToMetaConverter::Ptr BlobToROIConverter::create(BlobToMetaConverter::Initial
     else if (converter_name == YOLOv7Converter::getName())
         return BlobToMetaConverter::Ptr(
             new YOLOv7Converter(std::move(initializer), confidence_threshold, iou_threshold));
-    else if (converter_name == YOLOv8Converter::getName())
+    else if (converter_name == YOLOv8Converter::getName() || converter_name == YOLOv11Converter::getName())
         return BlobToMetaConverter::Ptr(
             new YOLOv8Converter(std::move(initializer), confidence_threshold, iou_threshold));
-    else if (converter_name == YOLOv8ObbConverter::getName())
+    else if (converter_name == YOLOv8ObbConverter::getName() || converter_name == YOLOv11ObbConverter::getName())
         return BlobToMetaConverter::Ptr(
             new YOLOv8ObbConverter(std::move(initializer), confidence_threshold, iou_threshold));
-    else if (converter_name == YOLOv8SegConverter::getName())
+    else if (converter_name == YOLOv8PoseConverter::getName() || converter_name == YOLOv11PoseConverter::getName())
+        return BlobToMetaConverter::Ptr(
+            new YOLOv8PoseConverter(std::move(initializer), confidence_threshold, iou_threshold));
+    else if (converter_name == YOLOv8SegConverter::getName() || converter_name == YOLOv11SegConverter::getName())
         return BlobToMetaConverter::Ptr(
             new YOLOv8SegConverter(std::move(initializer), confidence_threshold, iou_threshold));
     else if (converter_name == YOLOv10Converter::getName())
@@ -86,7 +95,7 @@ BlobToMetaConverter::Ptr BlobToROIConverter::create(BlobToMetaConverter::Initial
             new YOLOxConverter(std::move(initializer), confidence_threshold, iou_threshold, classes));
     }
 
-    throw std::runtime_error("Converter \"" + converter_name + "\" is not implemented.");
+    throw std::runtime_error("ToROIConverter \"" + converter_name + "\" is not implemented.");
 }
 
 TensorsTable BlobToROIConverter::toTensorsTable(const DetectedObjectsTable &bboxes_table) const {
@@ -143,9 +152,12 @@ void BlobToROIConverter::runNms(std::vector<DetectedObject> &candidates) const {
 
             assert(union_area != 0 && "union_area is null. Both of the boxes have zero areas.");
             const double overlap = inter_area / union_area;
-            if (overlap > iou_threshold)
+            if (overlap > iou_threshold) {
+                for (auto tensor : p_candidate->tensors) {
+                    gst_structure_free(tensor);
+                }
                 p_candidate = candidates.erase(p_candidate);
-            else
+            } else
                 ++p_candidate;
         }
     }

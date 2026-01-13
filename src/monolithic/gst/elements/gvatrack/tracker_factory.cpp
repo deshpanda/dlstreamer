@@ -1,5 +1,5 @@
 /*******************************************************************************
- * Copyright (C) 2018-2022 Intel Corporation
+ * Copyright (C) 2018-2025 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  ******************************************************************************/
@@ -8,6 +8,7 @@
 
 #include "tracker_factory.h"
 
+#include "deep_sort_tracker.h"
 #include "tracker.h"
 
 vas::ColorFormat gstVideoFmtToVasColorFmt(GstVideoFormat format) {
@@ -39,6 +40,7 @@ bool TrackerFactory::RegisterAll() {
                                  dlstreamer::MemoryMapperPtr mapper, dlstreamer::ContextPtr context) -> ITracker * {
         const vas::ColorFormat color_fmt = gstVideoFmtToVasColorFmt(gva_track->info->finfo->format);
         const std::string cfg = gva_track->tracking_config ? gva_track->tracking_config : std::string();
+        // cannot use smart pointers here
         return new VasWrapper::Tracker(gva_track->device, tracking_type, color_fmt, cfg, std::move(mapper),
                                        std::move(context));
     };
@@ -50,6 +52,19 @@ bool TrackerFactory::RegisterAll() {
                                        std::bind(create_vas_tracker, _1, TrackingType::SHORT_TERM_IMAGELESS, _2, _3));
     result &= TrackerFactory::Register(GstGvaTrackingType::ZERO_TERM_IMAGELESS,
                                        std::bind(create_vas_tracker, _1, TrackingType::ZERO_TERM_IMAGELESS, _2, _3));
+
+    // Register Deep SORT tracker - handles both with and without feature model
+    auto create_deep_sort_tracker = [](const GstGvaTrack *gva_track, dlstreamer::MemoryMapperPtr mapper,
+                                       dlstreamer::ContextPtr /*context*/) -> ITracker * {
+        std::string dptrckcfg = gva_track->deepsort_trck_cfg ? gva_track->deepsort_trck_cfg : "";
+
+        // Create Deep SORT tracker with external feature extraction model via gvainference
+        return new DeepSortWrapper::DeepSortTracker(DeepSortWrapper::DEFAULT_MAX_IOU_DISTANCE,
+                                                    DeepSortWrapper::DEFAULT_MAX_AGE, DeepSortWrapper::DEFAULT_N_INIT,
+                                                    DeepSortWrapper::DEFAULT_MAX_COSINE_DISTANCE,
+                                                    DeepSortWrapper::DEFAULT_NN_BUDGET, dptrckcfg, std::move(mapper));
+    };
+    result &= TrackerFactory::Register(GstGvaTrackingType::DEEP_SORT, create_deep_sort_tracker);
 
     return result;
 }

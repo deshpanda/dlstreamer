@@ -1,5 +1,5 @@
 /*******************************************************************************
- * Copyright (C) 2020-2021 Intel Corporation
+ * Copyright (C) 2020-2025 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  ******************************************************************************/
@@ -12,7 +12,11 @@
 
 #include <dlfcn.h>
 #include <gmodule.h>
+#ifdef _MSC_VER
+#include <pygobject.h>
+#else
 #include <pygobject-3.0/pygobject.h>
+#endif
 
 namespace {
 PyObject *extractClass(PyObjectWrapper &pluginModule, const char *class_name, const char *args_string,
@@ -54,10 +58,113 @@ gboolean callPython(GstBuffer *buffer, GstCaps *caps, PyObjectWrapper &py_frame_
 }
 } // namespace
 
+// This function safely imports a Python module from a given file path using Python's importlib.
+// It generates and executes Python code to load the module, handling errors and reporting them.
+// Arguments:
+//   module_name - the name to assign to the imported module in sys.modules
+//   file_path   - the path to the Python file (without .py extension)
+// Returns:
+//   A PyObject* pointer to the imported module, or NULL on error.
+PyObject *import_module_full_path(const char *module_name, const char *file_path) {
+
+    // Allocate memory for the file path with .py extension
+    char *pStr = new char[strlen(file_path) + 3];
+
+    // 0 is test for existence of file
+    sprintf(pStr, "%s", file_path);
+    if (access(pStr, 0) != 0) {
+        sprintf(pStr, "%s.py", file_path);
+        if (access(pStr, 0) != 0) {
+            GST_ERROR("Error: Python module file not found: %s\n", pStr);
+            delete[] pStr;
+
+            return NULL;
+        }
+    }
+
+    // Prepare Python code to import the module safely
+    char python_code[4096];
+    snprintf(python_code, sizeof(python_code),
+             "import importlib.util\n"
+             "import importlib.machinery\n"
+             "import sys\n"
+             "import os\n"
+             "\n"
+             "def create_spec_any_extension(module_name, file_path):\n"
+             "    loader = importlib.machinery.SourceFileLoader(module_name, file_path)\n"
+             "    spec = importlib.machinery.ModuleSpec(module_name, loader, origin = file_path)\n"
+             "    return spec\n"
+             "module_name = '%s'\n"
+             "file_path = r'%s'\n"
+             "\n"
+             "try:\n"
+             "    # Check if file exists\n"
+             "    if not os.path.exists(file_path):\n"
+             "        raise FileNotFoundError(f'Python module file not found: {file_path}')\n"
+             "    \n"
+             "    # Create spec\n"
+             "    spec = create_spec_any_extension(module_name, file_path)\n"
+             "    if spec is None:\n"
+             "        raise ImportError(f'Cannot create spec for {file_path}')\n"
+             "    \n"
+             "    # Create module\n"
+             "    module = importlib.util.module_from_spec(spec)\n"
+             "    if module is None:\n"
+             "        raise ImportError('Cannot create module from spec')\n"
+             "    \n"
+             "    # Add to sys.modules\n"
+             "    sys.modules[module_name] = module\n"
+             "    \n"
+             "    # Execute module\n"
+             "    spec.loader.exec_module(module)\n"
+             "    \n"
+             "    imported_module = module\n"
+             "    success = True\n"
+             "    error_msg = 'OK'\n"
+             "\n"
+             "except Exception as e:\n"
+             "    imported_module = None\n"
+             "    success = False\n"
+             "    error_msg = f'{type(e).__name__}: {str(e)}'\n",
+             module_name, pStr);
+
+    // Execute the generated Python code
+    // in the __main__ module's namespace
+    PyObject *main_module = PyImport_AddModule("__main__");
+    PyObject *main_dict = PyModule_GetDict(main_module);
+
+    if (PyRun_String(python_code, Py_file_input, main_dict, main_dict) == NULL) {
+        PyErr_Print();
+        delete[] pStr;
+        return NULL;
+    }
+
+    // Check result
+    PyObject *success = PyDict_GetItemString(main_dict, "success");
+    if (success && success == Py_True) {
+        PyObject *module = PyDict_GetItemString(main_dict, "imported_module");
+        if (module != NULL) {
+            Py_INCREF(module);
+            delete[] pStr;
+            return module;
+        }
+    } else {
+        PyObject *error = PyDict_GetItemString(main_dict, "error_msg");
+        if (error && PyUnicode_Check(error)) {
+            PyErr_Print();
+        }
+    }
+
+    delete[] pStr;
+
+    return NULL;
+}
+
 PythonContextInitializer::PythonContextInitializer() {
     state = PyGILState_UNLOCKED;
     if (Py_IsInitialized()) {
         state = PyGILState_Ensure();
+        has_old_state = true;
     } else {
         Py_Initialize();
     }
@@ -66,7 +173,7 @@ PythonContextInitializer::PythonContextInitializer() {
 }
 
 PythonContextInitializer::~PythonContextInitializer() {
-    if (Py_IsInitialized()) {
+    if (has_old_state) {
         PyGILState_Release(state);
     } else {
         PyEval_SaveThread();
@@ -76,6 +183,7 @@ PythonContextInitializer::~PythonContextInitializer() {
 void PythonContextInitializer::initialize() {
     /* load libpython.so and initilize pygobject */
     Dl_info libpython_info = Dl_info();
+#if !(_MSC_VER)
     dladdr((void *)Py_IsInitialized, &libpython_info);
     GModule *libpython = g_module_open(libpython_info.dli_fname, G_MODULE_BIND_LAZY);
     if (!pygobject_init(3, 0, 0)) {
@@ -84,6 +192,7 @@ void PythonContextInitializer::initialize() {
     if (libpython) {
         g_module_close(libpython);
     }
+#endif
     /* init arguments passed to a python script*/
     static wchar_t tmp[] = L"";
     static wchar_t *empty_argv[] = {tmp};
@@ -119,7 +228,7 @@ PythonCallback::PythonCallback(const char *module_path, const char *class_name, 
         module_name = std::string(filename, extension);
     }
 
-    PyObjectWrapper pluginModule(PyImport_Import(WRAPPER(PyUnicode_FromString(module_name.c_str()))));
+    PyObjectWrapper pluginModule = import_module_full_path(module_name.c_str(), module_path);
     if (!(PyObject *)pluginModule) {
         log_python_error(nullptr, false);
         throw std::runtime_error("Error loading Python module " + std::string(module_path));

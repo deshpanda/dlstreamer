@@ -1,5 +1,5 @@
 /*******************************************************************************
- * Copyright (C) 2018-2024 Intel Corporation
+ * Copyright (C) 2018-2025 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  ******************************************************************************/
@@ -9,9 +9,13 @@
 #include <openvino/runtime/properties.hpp>
 
 #include <dlstreamer/openvino/context.h>
-#include <dlstreamer/vaapi/context.h>
+#ifdef _WIN32
+#include <dlstreamer/d3d11/context.h>
+#endif
 // For logger_name
 #include <dlstreamer/element.h>
+
+#include <spdlog/fmt/bundled/ranges.h>
 
 #include "openvino_image_inference.h"
 
@@ -26,12 +30,15 @@
 #ifdef ENABLE_VAAPI
 #include <dlstreamer/vaapi/context.h>
 #include <openvino/runtime/intel_gpu/properties.hpp>
+#include <openvino/runtime/intel_npu/properties.hpp>
 #ifdef ENABLE_GPU_TILE_AFFINITY
 #include "vaapi_utils.h"
 #endif
 #endif
 
 #include <functional>
+#include <iterator>
+#include <regex>
 #include <stdio.h>
 #include <thread>
 
@@ -58,6 +65,12 @@ struct fmt::formatter<InferenceBackend::ImagePreprocessorType> : formatter<strin
         case ImagePreprocessorType::VAAPI_SURFACE_SHARING:
             name = "VAAPI Surface Sharing";
             break;
+        case ImagePreprocessorType::D3D11:
+            name = "D3D11 System Memory";
+            break;
+        case ImagePreprocessorType::D3D11_SURFACE_SHARING:
+            name = "D3D11 Surface Sharing";
+            break;
         }
         return formatter<string_view>::format(name, ctx);
     }
@@ -69,6 +82,9 @@ struct fmt::formatter<std::exception_ptr> {
     static constexpr size_t max_level = 5;
     mutable size_t level = 0;
 
+    // Fix for an AFL++ compilation issue
+    using return_type = decltype(std::declval<format_context>().out());
+
     constexpr auto parse(format_parse_context &ctx) {
         return ctx.begin();
     }
@@ -78,7 +94,7 @@ struct fmt::formatter<std::exception_ptr> {
     }
 
     template <typename T>
-    auto format_nested(const T &ex, format_context &ctx) const {
+    return_type format_nested(const T &ex, format_context &ctx) const {
         try {
             std::rethrow_if_nested(ex);
         } catch (...) {
@@ -90,7 +106,7 @@ struct fmt::formatter<std::exception_ptr> {
         return ctx.out();
     }
 
-    auto format(const std::exception_ptr &ex_ptr, format_context &ctx) const {
+    return_type format(const std::exception_ptr &ex_ptr, format_context &ctx) const {
         if (!ex_ptr)
             return fmt::format_to(ctx.out(), "<exception is nullptr>");
 
@@ -123,14 +139,24 @@ struct fmt::formatter<ov::AnyMap::value_type> {
 
 namespace {
 
-inline std::vector<std::string> split(const std::string &s, char delimiter) {
-    std::string token;
-    std::istringstream tokenStream(s);
-    std::vector<std::string> tokens;
-    while (std::getline(tokenStream, token, delimiter)) {
-        tokens.push_back(token);
+std::vector<std::string> split(const std::string &s, const std::string &delimiters) {
+    std::regex re("[" + delimiters + "]+");
+    std::sregex_token_iterator first{s.begin(), s.end(), re, -1}, last;
+    return {first, last};
+}
+
+std::vector<std::string> extractNumbers(const std::string &s) {
+    // Regular expression to match numbers, including negative and floating-point numbers
+    std::regex re(R"([-+]?\d*\.?\d+)");
+    std::sregex_iterator begin(s.begin(), s.end(), re);
+    std::sregex_iterator end;
+
+    std::vector<std::string> numbers;
+    for (std::sregex_iterator i = begin; i != end; ++i) {
+        numbers.push_back(i->str());
     }
-    return tokens;
+
+    return numbers;
 }
 
 const InputImageLayerDesc::Ptr
@@ -228,6 +254,14 @@ struct ConfigHelper {
         return base_config.at(KEY_MODEL);
     }
 
+    const std::string custom_preproc_lib() const {
+        return base_config.at(KEY_CUSTOM_PREPROC_LIB);
+    }
+
+    const std::string ov_extension_lib() const {
+        return base_config.at(KEY_OV_EXTENSION_LIB);
+    }
+
     int batch_size() const {
         return std::stoi(base_config.at(KEY_BATCH_SIZE));
     }
@@ -320,40 +354,30 @@ struct ConfigHelper {
         for (auto &item : params) {
             if (item.first == ov::num_streams.name()) {
                 m.emplace(item.first, ov::streams::Num(stoi(item.second)));
-            } else if (item.first == ov::hint::model_priority.name()) {
+            } else if (item.first == ov::log::level.name() || item.first == ov::cache_mode.name() ||
+                       item.first == ov::hint::enable_cpu_pinning.name() || item.first == ov::enable_profiling.name() ||
+                       item.first == ov::hint::model_priority.name() ||
+                       item.first == ov::hint::performance_mode.name() ||
+                       item.first == ov::hint::scheduling_core_type.name() ||
+                       item.first == ov::hint::execution_mode.name() ||
+                       item.first == ov::hint::enable_cpu_pinning.name() ||
+                       item.first == ov::hint::enable_hyper_threading.name() ||
+                       item.first == ov::hint::allow_auto_batching.name() ||
+                       item.first == ov::hint::inference_precision.name() ||
+                       item.first == ov::intel_gpu::enable_loop_unrolling.name() ||
+                       item.first == ov::intel_gpu::disable_winograd_convolution.name() ||
+                       item.first == ov::intel_gpu::hint::queue_throttle.name() ||
+                       item.first == ov::intel_gpu::hint::queue_priority.name() ||
+                       item.first == ov::intel_gpu::hint::host_task_priority.name() ||
+                       item.first == ov::intel_gpu::hint::enable_sdpa_optimization.name() ||
+                       item.first == ov::intel_npu::turbo.name()) {
                 m.emplace(item.first, item.second);
-            } else if (item.first == ov::hint::performance_mode.name()) {
-                m.emplace(item.first, item.second);
-            } else if (item.first == ov::hint::scheduling_core_type.name()) {
-                m.emplace(item.first, item.second);
-            } else if (item.first == ov::hint::enable_cpu_pinning.name()) {
-                m.emplace(item.first, bool(stoi(item.second)));
-            } else if (item.first == ov::hint::enable_hyper_threading.name()) {
-                m.emplace(item.first, bool(stoi(item.second)));
-            } else if (item.first == ov::hint::num_requests.name()) {
+            } else if (item.first == ov::optimal_batch_size.name() || item.first == ov::max_batch_size.name() ||
+                       item.first == ov::auto_batch_timeout.name() || item.first == ov::inference_num_threads.name() ||
+                       item.first == ov::compilation_num_threads.name() ||
+                       item.first == ov::hint::num_requests.name() ||
+                       item.first == ov::intel_npu::compilation_mode_params.name()) {
                 m.emplace(item.first, stoi(item.second));
-            } else if (item.first == ov::hint::allow_auto_batching.name()) {
-                m.emplace(item.first, bool(stoi(item.second)));
-            } else if (item.first == ov::hint::execution_mode.name()) {
-                m.emplace(item.first, item.second);
-            } else if (item.first == ov::enable_profiling.name()) {
-                m.emplace(item.first, bool(stoi(item.second)));
-            } else if (item.first == ov::log::level.name()) {
-                m.emplace(item.first, item.second);
-            } else if (item.first == ov::cache_mode.name()) {
-                m.emplace(item.first, item.second);
-            } else if (item.first == ov::optimal_batch_size.name()) {
-                m.emplace(item.first, stoi(item.second));
-            } else if (item.first == ov::max_batch_size.name()) {
-                m.emplace(item.first, stoi(item.second));
-            } else if (item.first == ov::auto_batch_timeout.name()) {
-                m.emplace(item.first, stoi(item.second));
-            } else if (item.first == ov::inference_num_threads.name()) {
-                m.emplace(item.first, stoi(item.second));
-            } else if (item.first == ov::compilation_num_threads.name()) {
-                m.emplace(item.first, stoi(item.second));
-            } else if (item.first == ov::affinity.name()) {
-                m.emplace(item.first, item.second);
             } else {
                 throw std::runtime_error("Unsupported inference param " + item.first);
             }
@@ -419,16 +443,28 @@ class OpenVinoNewApiImpl {
     };
 
   public:
+#ifndef ENABLE_D3D_NPU_COLOR_CONV
     OpenVinoNewApiImpl(const ConfigHelper &config, dlstreamer::ContextPtr context,
                        ImageInference::CallbackFunc callback, ImageInference::ErrorHandlingFunc error_handler,
                        MemoryType memory_type)
         : _app_context(std::move(context)), _memory_type(memory_type), _callback(callback),
           _error_handler(error_handler) {
-
+#else
+    OpenVinoNewApiImpl(const ConfigHelper &config, dlstreamer::ContextPtr context,
+                       ImageInference::CallbackFunc callback, ImageInference::ErrorHandlingFunc error_handler,
+                       MemoryType memory_type, InferenceBackend::ImagePreprocessorType pp_type)
+        : _app_context(std::move(context)), _memory_type(memory_type), _callback(callback), _pp_type(pp_type),
+          _error_handler(error_handler) {
+#endif
         log_api_message();
 
         _device = config.device();
         _nireq = config.nireq();
+
+        auto ov_extension_lib = config.ov_extension_lib();
+        if (!ov_extension_lib.empty()) {
+            core().add_extension(ov_extension_lib);
+        }
 
         // read model & configure model
         _model = core().read_model(config.model_path());
@@ -497,6 +533,8 @@ class OpenVinoNewApiImpl {
                 g_value_init(&gvalue, G_TYPE_STRING);
                 g_value_set_string(&gvalue, element.second.as<std::string>().c_str());
                 gst_structure_set_value(s, "converter", &gvalue);
+                GST_INFO("[get_model_info_postproc] model_type: %s", element.second.as<std::string>().c_str());
+                GST_INFO("[get_model_info_postproc] converter: %s", g_value_get_string(&gvalue));
                 g_value_unset(&gvalue);
             }
             if ((element.first.find("multilabel") != std::string::npos) &&
@@ -509,6 +547,8 @@ class OpenVinoNewApiImpl {
                 else
                     g_value_set_string(&gvalue, "multi");
                 gst_structure_set_value(s, "method", &gvalue);
+                GST_INFO("[get_model_info_postproc] multilabel: %s", element.second.as<std::string>().c_str());
+                GST_INFO("[get_model_info_postproc] method: %s", g_value_get_string(&gvalue));
                 g_value_unset(&gvalue);
             }
             if ((element.first.find("output_raw_scores") != std::string::npos) &&
@@ -521,6 +561,8 @@ class OpenVinoNewApiImpl {
                 else
                     g_value_set_string(&gvalue, "softmax");
                 gst_structure_set_value(s, "method", &gvalue);
+                GST_INFO("[get_model_info_postproc] output_raw_scores: %s", element.second.as<std::string>().c_str());
+                GST_INFO("[get_model_info_postproc] method: %s", g_value_get_string(&gvalue));
                 g_value_unset(&gvalue);
             }
             if (element.first.find("confidence_threshold") != std::string::npos) {
@@ -528,6 +570,7 @@ class OpenVinoNewApiImpl {
                 g_value_init(&gvalue, G_TYPE_DOUBLE);
                 g_value_set_double(&gvalue, element.second.as<double>());
                 gst_structure_set_value(s, "confidence_threshold", &gvalue);
+                GST_INFO("[get_model_info_postproc] confidence_threshold: %f", element.second.as<double>());
                 g_value_unset(&gvalue);
             }
             if (element.first.find("iou_threshold") != std::string::npos) {
@@ -535,19 +578,53 @@ class OpenVinoNewApiImpl {
                 g_value_init(&gvalue, G_TYPE_DOUBLE);
                 g_value_set_double(&gvalue, element.second.as<double>());
                 gst_structure_set_value(s, "iou_threshold", &gvalue);
+                GST_INFO("[get_model_info_postproc] iou_threshold: %f", element.second.as<double>());
+                g_value_unset(&gvalue);
+            }
+            if (element.first.find("image_threshold") != std::string::npos) {
+                GValue gvalue = G_VALUE_INIT;
+                g_value_init(&gvalue, G_TYPE_DOUBLE);
+                g_value_set_double(&gvalue, element.second.as<double>());
+                gst_structure_set_value(s, "image_threshold", &gvalue);
+                GST_INFO("[get_model_info_postproc] image_threshold: %f", element.second.as<double>());
+                g_value_unset(&gvalue);
+            }
+            if (element.first.find("pixel_threshold") != std::string::npos) {
+                GValue gvalue = G_VALUE_INIT;
+                g_value_init(&gvalue, G_TYPE_DOUBLE);
+                g_value_set_double(&gvalue, element.second.as<double>());
+                gst_structure_set_value(s, "pixel_threshold", &gvalue);
+                GST_INFO("[get_model_info_postproc] pixel_threshold: %f", element.second.as<double>());
+                g_value_unset(&gvalue);
+            }
+            if (element.first.find("normalization_scale") != std::string::npos) {
+                GValue gvalue = G_VALUE_INIT;
+                g_value_init(&gvalue, G_TYPE_DOUBLE);
+                g_value_set_double(&gvalue, element.second.as<double>());
+                gst_structure_set_value(s, "normalization_scale", &gvalue);
+                GST_INFO("[get_model_info_postproc] normalization_scale: %f", element.second.as<double>());
+                g_value_unset(&gvalue);
+            }
+            if (element.first.find("task") != std::string::npos) {
+                GValue gvalue = G_VALUE_INIT;
+                g_value_init(&gvalue, G_TYPE_STRING);
+                g_value_set_string(&gvalue, element.second.as<std::string>().c_str());
+                gst_structure_set_value(s, "anomaly_task", &gvalue);
+                GST_INFO("[get_model_info_postproc] anomaly_task: %s", element.second.as<std::string>().c_str());
                 g_value_unset(&gvalue);
             }
             if (element.first.find("labels") != std::string::npos) {
                 GValue gvalue = G_VALUE_INIT;
                 g_value_init(&gvalue, GST_TYPE_ARRAY);
                 std::string labels_string = element.second.as<std::string>();
-                std::vector<std::string> labels = split(labels_string, ' ');
+                std::vector<std::string> labels = split(labels_string, ",; ");
                 for (auto &el : labels) {
                     GValue label = G_VALUE_INIT;
                     g_value_init(&label, G_TYPE_STRING);
                     g_value_set_string(&label, el.c_str());
                     gst_value_array_append_value(&gvalue, &label);
                     g_value_unset(&label);
+                    GST_INFO("[get_model_info_postproc] label: %s", el.c_str());
                 }
                 gst_structure_set_value(s, "labels", &gvalue);
                 g_value_unset(&gvalue);
@@ -564,18 +641,43 @@ class OpenVinoNewApiImpl {
     }
 
     // convert ov::Any to GstStructure
-    static std::map<std::string, GstStructure *> get_model_info_preproc(const std::string model_file) {
+    static std::map<std::string, GstStructure *>
+    get_model_info_preproc(const std::string model_file, const gchar *pre_proc_config, const gchar *ov_extension_lib) {
         std::map<std::string, GstStructure *> res;
         std::string layer_name("ANY");
         GstStructure *s = nullptr;
         ov::AnyMap modelConfig;
 
+        if (ov_extension_lib && ov_extension_lib[0] != '\0') {
+            core().add_extension(ov_extension_lib);
+        }
+
         std::shared_ptr<ov::Model> _model;
         _model = core().read_model(model_file);
+
+        // Warn if model quantization runtime does not match current runtime
+        if (_model->has_rt_info({"nncf"})) {
+            const ov::AnyMap nncfConfig = _model->get_rt_info<const ov::AnyMap>("nncf");
+            const std::string modelVersion = _model->get_rt_info<const std::string>("Runtime_version");
+            const std::string runtimeVersion = ov::get_openvino_version().buildNumber;
+
+            if (nncfConfig.count("quantization") && (modelVersion != runtimeVersion))
+                g_warning("Model quantization runtime (%s) does not match current runtime (%s). Results may be "
+                          "inaccurate. Please re-quantize the model with the current runtime version.",
+                          modelVersion.c_str(), runtimeVersion.c_str());
+        }
 
         if (_model->has_rt_info({"model_info"})) {
             modelConfig = _model->get_rt_info<ov::AnyMap>("model_info");
             s = gst_structure_new_empty(layer_name.data());
+        }
+
+        // override model config with command line pre-processing parameters if provided
+        auto pre_proc_params = Utils::stringToMap(pre_proc_config);
+        for (auto &item : pre_proc_params) {
+            if (modelConfig.find(item.first) != modelConfig.end()) {
+                modelConfig[item.first] = item.second;
+            }
         }
 
         // the parameter parsing loop may use locale-dependent floating point conversion
@@ -584,27 +686,118 @@ class OpenVinoNewApiImpl {
         std::setlocale(LC_ALL, "C");
 
         for (auto &element : modelConfig) {
-            if (element.first.find("scale_values") != std::string::npos) {
+            if (element.first == "scale_values") {
+                std::vector<std::string> values = extractNumbers(element.second.as<std::string>());
+                if (values.size() == 1) {
+                    GValue gvalue = G_VALUE_INIT;
+                    g_value_init(&gvalue, G_TYPE_DOUBLE);
+                    g_value_set_double(&gvalue, element.second.as<double>());
+                    gst_structure_set_value(s, "scale", &gvalue);
+                    GST_INFO("[get_model_info_preproc] scale: %f", element.second.as<double>());
+                    g_value_unset(&gvalue);
+                } else if (values.size() == 3) {
+
+                    std::vector<double> scale_values;
+                    // If there are three values, use them directly
+                    for (const std::string &valueStr : values) {
+                        scale_values.push_back(std::stod(valueStr));
+                    }
+                    // Create a GST_TYPE_ARRAY to hold the scale values
+                    GValue gvalue = G_VALUE_INIT;
+                    g_value_init(&gvalue, GST_TYPE_ARRAY);
+                    for (double scale_value : scale_values) {
+                        GValue item = G_VALUE_INIT;
+                        g_value_init(&item, G_TYPE_DOUBLE);
+                        g_value_set_double(&item, scale_value);
+                        gst_value_array_append_value(&gvalue, &item);
+                        GST_INFO("[get_model_info_preproc] scale_values: %f", scale_value);
+                        g_value_unset(&item);
+                    }
+
+                    // Set the array in the GstStructure
+                    gst_structure_set_value(s, "std", &gvalue);
+                    g_value_unset(&gvalue);
+                } else {
+                    throw std::runtime_error("Invalid number of scale values. Expected 1 or 3 values.");
+                }
+            }
+            if (element.first == "mean_values") {
+                std::vector<std::string> values = extractNumbers(element.second.as<std::string>());
+                std::vector<double> scale_values;
+
+                if (values.size() == 3) {
+                    // If there are three values, use them directly
+                    for (const std::string &valueStr : values) {
+                        scale_values.push_back(std::stod(valueStr));
+                    }
+                } else {
+                    throw std::runtime_error("Invalid number of mean values. Expected 3 values.");
+                }
+
+                // Create a GST_TYPE_ARRAY to hold the scale values
                 GValue gvalue = G_VALUE_INIT;
-                g_value_init(&gvalue, G_TYPE_DOUBLE);
-                g_value_set_double(&gvalue, element.second.as<double>());
-                gst_structure_set_value(s, "scale", &gvalue);
+                g_value_init(&gvalue, GST_TYPE_ARRAY);
+                for (double scale_value : scale_values) {
+                    GValue item = G_VALUE_INIT;
+                    g_value_init(&item, G_TYPE_DOUBLE);
+                    g_value_set_double(&item, scale_value);
+                    gst_value_array_append_value(&gvalue, &item);
+                    g_value_unset(&item);
+                }
+
+                // Set the array in the GstStructure
+                gst_structure_set_value(s, "mean", &gvalue);
+                GST_INFO("[get_model_info_preproc] mean: %s", g_value_get_string(&gvalue));
                 g_value_unset(&gvalue);
             }
-            if ((element.first.find("resize_type") != std::string::npos) &&
-                (element.second.as<std::string>().find("fit_to_window_letterbox") != std::string::npos)) {
+            if (element.first == "resize_type") {
                 GValue gvalue = G_VALUE_INIT;
                 g_value_init(&gvalue, G_TYPE_STRING);
-                g_value_set_string(&gvalue, "aspect-ratio");
-                gst_structure_set_value(s, "resize", &gvalue);
+
+                if (element.second.as<std::string>() == "crop") {
+                    g_value_set_string(&gvalue, "central-resize");
+                    gst_structure_set_value(s, "crop", &gvalue);
+                }
+                if (element.second.as<std::string>() == "fit_to_window_letterbox") {
+                    g_value_set_string(&gvalue, "aspect-ratio");
+                    gst_structure_set_value(s, "resize", &gvalue);
+                }
+                if (element.second.as<std::string>() == "fit_to_window") {
+                    g_value_set_string(&gvalue, "aspect-ratio-pad");
+                    gst_structure_set_value(s, "resize", &gvalue);
+                }
+                if (element.second.as<std::string>() == "standard") {
+                    g_value_set_string(&gvalue, "no-aspect-ratio");
+                    gst_structure_set_value(s, "resize", &gvalue);
+                }
+                GST_INFO("[get_model_info_preproc] resize_type: %s", element.second.as<std::string>().c_str());
+                GST_INFO("[get_model_info_preproc] resize: %s", g_value_get_string(&gvalue));
                 g_value_unset(&gvalue);
             }
-            if ((element.first.find("reverse_input_channels") != std::string::npos) &&
-                (element.second.as<std::string>().find("YES") != std::string::npos)) {
+            if (element.first == "color_space") {
+                GValue gvalue = G_VALUE_INIT;
+                g_value_init(&gvalue, G_TYPE_STRING);
+                g_value_set_string(&gvalue, element.second.as<std::string>().c_str());
+                gst_structure_set_value(s, "color_space", &gvalue);
+                GST_INFO("[get_model_info_preproc] reverse_input_channels: %s",
+                         element.second.as<std::string>().c_str());
+                GST_INFO("[get_model_info_preproc] color_space: %s", g_value_get_string(&gvalue));
+                g_value_unset(&gvalue);
+            }
+            if (element.first == "reverse_input_channels") {
                 GValue gvalue = G_VALUE_INIT;
                 g_value_init(&gvalue, G_TYPE_INT);
-                g_value_set_int(&gvalue, gint(true));
+                g_value_set_int(&gvalue, gint(false));
+
+                std::transform(element.second.as<std::string>().begin(), element.second.as<std::string>().end(),
+                               element.second.as<std::string>().begin(), ::tolower);
+
+                if (element.second.as<std::string>() == "yes" || element.second.as<std::string>() == "true")
+                    g_value_set_int(&gvalue, gint(true));
+
                 gst_structure_set_value(s, "reverse_input_channels", &gvalue);
+                GST_INFO("[get_model_info_preproc] reverse_input_channels: %s",
+                         element.second.as<std::string>().c_str());
                 g_value_unset(&gvalue);
             }
         }
@@ -663,9 +856,29 @@ class OpenVinoNewApiImpl {
 
         switch (_memory_type) {
         case MemoryType::SYSTEM:
-            format = FourCC::FOURCC_RGBP;
+#ifndef ENABLE_D3D_NPU_COLOR_CONV
+            if (_model_format == "BGR")
+                format = FourCC::FOURCC_BGRP;
+            else
+                format = FourCC::FOURCC_RGBP;
             break;
+#else
+            if (_pp_type == InferenceBackend::ImagePreprocessorType::D3D11) {
+                if (_model_format == "BGR")
+                    format = FourCC::FOURCC_BGRX;
+                else
+                    format = FourCC::FOURCC_RGBX;
+                break;
+            } else {
+                if (_model_format == "BGR")
+                    format = FourCC::FOURCC_BGRP;
+                else
+                    format = FourCC::FOURCC_RGBP;
+                break;
+            }
+#endif
         case MemoryType::VAAPI:
+        case MemoryType::D3D11:
             format = FourCC::FOURCC_NV12;
             break;
         default:
@@ -683,11 +896,16 @@ class OpenVinoNewApiImpl {
 
     static bool image_has_roi(const Image &image) {
         const auto r = image.rect;
-        return r.x || r.y || r.width != image.width || r.height != image.height;
+        return r.x || r.y || ((r.width > 0) && (r.width != image.width)) ||
+               ((r.height > 0) && (r.height != image.height));
     }
 
     std::vector<ov::Tensor> image_to_tensors(const Image &image) {
         switch (image.format) {
+        case FourCC::FOURCC_RGBP:
+        case FourCC::FOURCC_BGRP:
+            return {image_rgbp_to_tensor(image)};
+
         case FourCC::FOURCC_BGRA:
         case FourCC::FOURCC_BGRX:
         case FourCC::FOURCC_RGBA:
@@ -706,6 +924,40 @@ class OpenVinoNewApiImpl {
         default:
             throw std::logic_error("Unsupported image type");
         }
+    }
+
+    ov::Tensor image_rgbp_to_tensor(const Image &image) {
+        // Input image has 3 planes, separately for RBG (or BGR)
+        // This function converts 3 planes to ov::Tensor with NCHW layout
+        // planes must be equally spaced in memory, and have same stride
+        assert(image.planes[0] && image.planes[1] && image.planes[2]);
+        assert((image.planes[1] - image.planes[0]) == (image.planes[2] - image.planes[1]));
+        assert((image.stride[0] == image.stride[1]) && (image.stride[1] == image.stride[2]));
+
+        auto channels_num = get_channels_num(image.format);
+        const ov::Shape shape{1, channels_num, size_t(image.height), size_t(image.width)};
+        unsigned long plane_stride = image.planes[1] - image.planes[0];
+        ov::Strides stride{channels_num * plane_stride, plane_stride, image.stride[0], 1};
+        ov::Tensor tensor{ov::element::u8, shape, image.planes[0], stride};
+
+        // ROI
+        if (image_has_roi(image)) {
+            const auto &r = image.rect;
+            const ov::Coordinate begin{0, 0, r.y, r.x};
+            const ov::Coordinate end{shape[0], shape[1], r.y + r.height, r.x + r.width};
+            tensor = ov::Tensor(tensor, begin, end);
+        }
+
+        // Allocate new tensor in host memory and COPY data if the original tensor is not contigous
+        // - NPU device plugin requires contigous tensors (explicit assert)
+        // - GPU plugin fails in certain cases with non-contigous tensors
+        if (!tensor.is_continuous()) {
+            ov::Tensor sparse_tensor(tensor);
+            tensor = ov::Tensor(ov::element::u8, sparse_tensor.get_shape());
+            sparse_tensor.copy_to(tensor);
+        }
+
+        return tensor;
     }
 
     ov::Tensor image_bgrx_to_tensor(const Image &image) {
@@ -805,6 +1057,8 @@ class OpenVinoNewApiImpl {
         case FourCC::FOURCC_RGBX:
             return 4;
         case FourCC::FOURCC_BGR:
+        case FourCC::FOURCC_RGBP:
+        case FourCC::FOURCC_BGRP:
             return 3;
         }
         return 0;
@@ -818,12 +1072,16 @@ class OpenVinoNewApiImpl {
 
   protected:
     std::shared_ptr<ov::Model> _model;
+    std::string _model_format;
     std::string _device;
     std::string _image_input_name;
     dlstreamer::ContextPtr _app_context;
     dlstreamer::OpenVINOContextPtr _openvino_context;
     ov::CompiledModel _compiled_model;
     MemoryType _memory_type;
+#ifdef ENABLE_D3D_NPU_COLOR_CONV
+    InferenceBackend::ImagePreprocessorType _pp_type;
+#endif
     int _nireq = 0;
     int _batch_size = 0;
 
@@ -843,6 +1101,7 @@ class OpenVinoNewApiImpl {
         auto ppp = ov::preprocess::PrePostProcessor(_model);
         configure_model_inputs(config, ppp);
         _model = ppp.build();
+        _model_format = config.model_format();
 
         // dynamic shapes may have height=0 and width=0 after IE preprocessing
         // set lower and upper bound of dynamic shapes to match original frame dimensions
@@ -853,6 +1112,14 @@ class OpenVinoNewApiImpl {
         }
 
         _batch_size = config.batch_size();
+        if (_batch_size == 0) {
+            try {
+                _batch_size = core().get_property(config.device(), ov::optimal_batch_size);
+            } catch (...) {
+                _batch_size = 1; // Fallback if optimal batch size property is not supported
+            }
+        }
+
         GVA_DEBUG("Setting batch size of %d to model", _batch_size);
         ov::set_batch(_model, _batch_size);
 
@@ -969,10 +1236,23 @@ class OpenVinoNewApiImpl {
         GVA_DEBUG("%s", pp_type_string.c_str());
 
         // OPENCV and VAAPI pre-processors handle color coversion and scaling, input tensors in NCHW format
-        if (pp_type == ImagePreprocessorType::OPENCV || pp_type == ImagePreprocessorType::VAAPI_SYSTEM) {
+        if (pp_type == ImagePreprocessorType::OPENCV || pp_type == ImagePreprocessorType::VAAPI_SYSTEM ||
+            pp_type == ImagePreprocessorType::D3D11) {
             input.tensor().set_layout("NCHW");
         }
 
+#ifdef ENABLE_D3D_NPU_COLOR_CONV
+        if (pp_type == ImagePreprocessorType::D3D11) {
+            input.tensor().set_layout("NHWC");
+            if (_model_format == "BGR") {
+                input.tensor().set_color_format(ov::preprocess::ColorFormat::BGRX);
+                input.preprocess().convert_color(ov::preprocess::ColorFormat::BGR);
+            } else {
+                input.tensor().set_color_format(ov::preprocess::ColorFormat::RGBX);
+                input.preprocess().convert_color(ov::preprocess::ColorFormat::RGB);
+            }
+        }
+#endif
         // OV preprocessing is configured only for IE or VAAPI_SURFACE_SHARING
         if (pp_type == ImagePreprocessorType::VAAPI_SURFACE_SHARING || pp_type == ImagePreprocessorType::IE) {
 
@@ -1139,20 +1419,39 @@ class OpenVinoNewApiImpl {
 
     dlstreamer::ContextPtr create_remote_context() {
         // FIXME: invert to reduce nesting
-        if (is_device_gpu() && !is_device_multi() &&
-            (_memory_type == MemoryType::VAAPI || _memory_type == MemoryType::SYSTEM)) {
-            if (_app_context) {
-                try {
-                    dlstreamer::VAAPIContextPtr vaapi_ctx = dlstreamer::VAAPIContext::create(_app_context);
-                    _openvino_context = std::make_shared<dlstreamer::OpenVINOContext>(core(), _device, vaapi_ctx);
-                } catch (std::exception &e) {
-                    GVA_ERROR("Exception occurred when creating OpenVINO™ toolkit remote context: %s", e.what());
-                    std::throw_with_nested(std::runtime_error("couldn't create OV remote context"));
-                }
+        if (is_device_gpu() && !is_device_multi()) {
+#ifdef _WIN32
+            if (_memory_type == MemoryType::D3D11 || _memory_type == MemoryType::SYSTEM) {
+                if (_app_context) {
+                    try {
+                        dlstreamer::D3D11ContextPtr d3d11_ctx = dlstreamer::D3D11Context::create(_app_context);
+                        _openvino_context = std::make_shared<dlstreamer::OpenVINOContext>(core(), _device, d3d11_ctx);
+                    } catch (std::exception &e) {
+                        GVA_ERROR("Exception occurred when creating OpenVINO™ toolkit remote context: %s", e.what());
+                        std::throw_with_nested(std::runtime_error("couldn't create OV remote context"));
+                    }
 
-            } else if (_memory_type == MemoryType::VAAPI) {
-                throw std::runtime_error("Display must be provided for GPU device with vaapi-surface-sharing backend");
+                } else if (_memory_type == MemoryType::D3D11) {
+                    throw std::runtime_error("Display must be provided for GPU device with d3d11 backend");
+                }
             }
+#else
+            if (_memory_type == MemoryType::VAAPI || _memory_type == MemoryType::SYSTEM) {
+                if (_app_context) {
+                    try {
+                        dlstreamer::VAAPIContextPtr vaapi_ctx = dlstreamer::VAAPIContext::create(_app_context);
+                        _openvino_context = std::make_shared<dlstreamer::OpenVINOContext>(core(), _device, vaapi_ctx);
+                    } catch (std::exception &e) {
+                        GVA_ERROR("Exception occurred when creating OpenVINO™ toolkit remote context: %s", e.what());
+                        std::throw_with_nested(std::runtime_error("couldn't create OV remote context"));
+                    }
+
+                } else if (_memory_type == MemoryType::VAAPI) {
+                    throw std::runtime_error(
+                        "Display must be provided for GPU device with vaapi-surface-sharing backend");
+                }
+            }
+#endif
         }
         return _openvino_context;
     }
@@ -1161,7 +1460,7 @@ class OpenVinoNewApiImpl {
 void OpenVINOImageInference::SetCompletionCallback(std::shared_ptr<BatchRequest> &batch_request) {
     assert(batch_request && "Batch request is null");
 
-    auto cb = [=](std::exception_ptr ex) {
+    auto cb = [=, this](std::exception_ptr ex) {
         ITT_TASK("completion_callback_lambda_new");
 
         try {
@@ -1190,10 +1489,17 @@ OpenVINOImageInference::OpenVINOImageInference(const InferenceBackend::Inference
 
     try {
         ConfigHelper cfg_helper(config);
+        const auto pp_type = cfg_helper.pp_type();
+#ifndef ENABLE_D3D_NPU_COLOR_CONV
         _impl = std::make_unique<OpenVinoNewApiImpl>(cfg_helper, context, callback, error_handler, memory_type);
+#else
+        _impl =
+            std::make_unique<OpenVinoNewApiImpl>(cfg_helper, context, callback, error_handler, memory_type, pp_type);
+#endif
 
         model_name = _impl->_model->get_friendly_name();
         nireq = _impl->_nireq;
+        batch_size = _impl->_batch_size;
         image_layer = _impl->_image_input_name;
 
         for (int i = 0; i < nireq; i++) {
@@ -1204,14 +1510,16 @@ OpenVINOImageInference::OpenVINOImageInference(const InferenceBackend::Inference
             freeRequests.push(batch_request);
         }
 
-        const auto pp_type = cfg_helper.pp_type();
-
-        // FIXME: why VAAPI ?
+#ifndef ENABLE_D3D_NPU_COLOR_CONV
         if (pp_type == InferenceBackend::ImagePreprocessorType::OPENCV ||
-            pp_type == InferenceBackend::ImagePreprocessorType::VAAPI_SYSTEM) {
+            pp_type == InferenceBackend::ImagePreprocessorType::D3D11) {
+#else
+        if (pp_type == InferenceBackend::ImagePreprocessorType::OPENCV) {
+#endif
             std::string pp_type_string = fmt::format("creating pre-processor, type: {}", pp_type);
             GVA_INFO("%s", pp_type_string.c_str());
-            pre_processor.reset(InferenceBackend::ImagePreprocessor::Create(pp_type));
+            const std::string custom_preproc_lib = cfg_helper.custom_preproc_lib();
+            pre_processor.reset(InferenceBackend::ImagePreprocessor::Create(pp_type, custom_preproc_lib));
         }
 
     } catch (const std::exception &e) {
@@ -1235,103 +1543,6 @@ void OpenVINOImageInference::FreeRequest(std::shared_ptr<BatchRequest> request) 
     request_processed_.notify_all();
 }
 
-#if 0
-InferenceEngine::RemoteContext::Ptr
-OpenVINOImageInference::CreateRemoteContext(const InferenceBackend::InferenceConfig &config) {
-    InferenceEngine::RemoteContext::Ptr remote_context;
-    const std::string &device = config.at(KEY_BASE).at(KEY_DEVICE);
-
-#ifdef ENABLE_VPUX
-    std::string vpu_device_name;
-    bool has_vpu_device_id = false;
-    std::tie(has_vpu_device_id, vpu_device_name) = Utils::parseDeviceName(device);
-    if (!vpu_device_name.empty()) {
-        const std::string msg = "VPUX device defined as " + vpu_device_name;
-        GVA_INFO(msg.c_str());
-
-        const std::string base_device = "VPUX";
-        std::string device = vpu_device_name;
-        if (!has_vpu_device_id) {
-            // Retrieve ID of the first available device
-            std::vector<std::string> device_list =
-                IeCoreSingleton::Instance().GetMetric(base_device, METRIC_KEY(AVAILABLE_DEVICES));
-            if (!device_list.empty())
-                device = device_list.at(0);
-            // else device is already set to VPU-0
-        }
-        const InferenceEngine::ParamMap params = {{InferenceEngine::KMB_PARAM_KEY(DEVICE_ID), device}};
-        remote_context = IeCoreSingleton::Instance().CreateContext(base_device, params);
-    }
-#endif
-
-#ifdef ENABLE_VAAPI
-    const bool is_gpu_device = device.rfind("GPU", 0) == 0;
-    // There are 3 possible scenarios:
-    // 1. memory_type == VAAPI: we are going to use the surface sharing mode and we have to provide
-    // VADisplay to GPU plugin so it can work with VaSurfaces that we are going to submit via BLOBs.
-    // 2.1. memory_type == SYSTEM and display is available: VAAPI serves only as pre-processing and
-    // we don't have to provide VADisplay to the plugin in such case. However, by providing VADisplay,
-    // we can make sure that the plugin will choose the same GPU for inference as for decoding by
-    // vaapi elements.
-    // 2.2. memory_type == SYSTEM and display is not available: user chose to perform decode on CPU
-    // and inference on GPU. IE pre-processing is used in this case.
-    // In cases 1 and 2.1 we don't need to specify GPU number (GPU.0, GPU.1) to achieve device affinity.
-    // In case 2.2 user may choose desired GPU for inference. Currently matching GPU ID to actual
-    // hardware is not possible due to OpenVINO™ API lacking.
-    if (is_gpu_device && (memory_type == MemoryType::VAAPI || memory_type == MemoryType::SYSTEM)) {
-        if (context_) {
-            using namespace InferenceEngine;
-
-            // TODO: Bug in OpenVINO™ 2021.4.X. Caused by using GPU_THROUGHPUT_STREAMS=GPU_THROUGHPUT_AUTO.
-            // During CreateContext() call, IE creates queues for each of GPU_THROUGHPUT_STREAMS. By
-            // default GPU_THROUGHPUT_STREAMS is set to 1, so IE creates only 1 queue. Then, during
-            // LoadNetwork() call we pass GPU_THROUGHPUT_STREAMS=GPU_THROUGHPUT_AUTO and GPU plugin may
-            // set number of streams to more than 1 (for example, 2). Then for each of the streams (2)
-            // GPU plugin tries to get IE queue, but fails because number of streams is greater than
-            // number of created queues.
-            // Because of that user may get an error:
-            //     Unable to create network with stream_id=1
-            // Workaround for this is to set GPU_THROUGHPUT_STREAMS to IE prior to CreateContext() call.
-            auto &ie_config = config.at(KEY_INFERENCE);
-            auto it = ie_config.find(KEY_GPU_THROUGHPUT_STREAMS);
-            if (it != ie_config.end())
-                IeCoreSingleton::Instance().SetConfig({*it}, "GPU");
-
-            auto va_display = context_->handle(dlstreamer::VAAPIContext::key::va_display);
-            if (!va_display)
-                throw std::runtime_error("Error getting va_display from context");
-
-            InferenceEngine::ParamMap contextParams = {
-                {GPU_PARAM_KEY(CONTEXT_TYPE), GPU_PARAM_VALUE(VA_SHARED)},
-                {GPU_PARAM_KEY(VA_DEVICE), static_cast<InferenceEngine::gpu_handle_param>(va_display)}};
-
-            // GPU tile affinity
-            if (device == "GPU.x") {
-#ifdef ENABLE_GPU_TILE_AFFINITY
-                VaDpyWrapper dpyWrapper(va_display);
-                int tile_id = dpyWrapper.currentSubDevice();
-                // If tile_id is -1 (single-tile GPU is used or the driver doesn't support this feature)
-                // then GPU plugin will choose the device and tile on its own and there will be no affinity
-                contextParams.insert({GPU_PARAM_KEY(TILE_ID), tile_id});
-#else
-                GVA_WARNING("Current version of OpenVINO™ toolkit doesn't support tile affinity, version 2022.1 or "
-                            "higher is required");
-#endif
-            }
-
-            remote_context = IeCoreSingleton::Instance().CreateContext("GPU", contextParams);
-        } else if (memory_type == MemoryType::VAAPI) {
-            throw std::runtime_error("Display must be provided for GPU device with vaapi-surface-sharing backend");
-        }
-    }
-#else
-    UNUSED(device);
-#endif
-
-    return remote_context;
-}
-#endif
-
 bool OpenVINOImageInference::IsQueueFull() {
     return freeRequests.empty();
 }
@@ -1349,7 +1560,7 @@ Image fill_image(ov::Tensor &tensor, size_t bindex) {
         throw std::out_of_range("Image index is out of range in batch blob");
     }
     auto elem_type = tensor.get_element_type();
-    size_t plane_size = image.width * image.height * elem_type.size();
+    size_t plane_size = safe_mul(size_t(safe_mul(image.width, image.height)), elem_type.size());
     size_t buffer_offset = safe_mul(safe_mul(bindex, plane_size), dims[1]);
 
     image.planes[0] = static_cast<uint8_t *>(tensor.data()) + buffer_offset;
@@ -1437,8 +1648,31 @@ void OpenVINOImageInference::BypassImageProcessing(const std::string &input_name
     }
 }
 
-bool OpenVINOImageInference::DoNeedImagePreProcessing() const {
-    return pre_processor.get() != nullptr;
+bool OpenVINOImageInference::DoNeedImagePreProcessing(const InferenceBackend::ImagePtr image) {
+    if (pre_processor.get() != nullptr)
+        return true;
+
+    if (image == nullptr)
+        return false;
+
+    // workaround for NPU plugin serialization when non-contiguous tensors submitted
+    if ((_impl->_device.find("NPU") != std::string::npos) && (_impl->_memory_type == MemoryType::SYSTEM) &&
+        ((image->format == FourCC::FOURCC_RGBP) || (image->format == FourCC::FOURCC_BGRP))) {
+
+        bool contiguous = (image->planes[1] - image->planes[0] == image->width * image->height) &&
+                          (image->planes[2] - image->planes[1] == image->width * image->height) &&
+                          (image->stride[0] == image->stride[1]) && (image->stride[1] == image->stride[2]) &&
+                          (image->stride[2] == image->width);
+
+        if (!contiguous) {
+            GVA_WARNING("Force OPENCV preprocessor to convert non-contiguous tensors into contigous memory location");
+            pre_processor.reset(
+                InferenceBackend::ImagePreprocessor::Create(InferenceBackend::ImagePreprocessorType::OPENCV, ""));
+            return true;
+        }
+    }
+
+    return false;
 }
 
 void OpenVINOImageInference::ApplyInputPreprocessors(
@@ -1451,7 +1685,7 @@ void OpenVINOImageInference::ApplyInputPreprocessors(
             continue;
 
         if (preprocessor.first == KEY_image) {
-            if (!DoNeedImagePreProcessing())
+            if (!DoNeedImagePreProcessing(nullptr))
                 continue;
         }
 
@@ -1480,7 +1714,7 @@ void OpenVINOImageInference::SubmitImage(
     std::shared_ptr<BatchRequest> request = freeRequests.pop();
 
     try {
-        if (DoNeedImagePreProcessing()) {
+        if (DoNeedImagePreProcessing(frame->GetImage())) {
             SubmitImageProcessing(
                 image_layer, request, *frame->GetImage(),
                 getImagePreProcInfo(input_preprocessors), // contain operations order for Custom Image PreProcessing
@@ -1518,6 +1752,10 @@ const std::string &OpenVINOImageInference::GetModelName() const {
     return model_name;
 }
 
+size_t OpenVINOImageInference::GetBatchSize() const {
+    return safe_convert<size_t>(batch_size);
+}
+
 size_t OpenVINOImageInference::GetNireq() const {
     return safe_convert<size_t>(nireq);
 }
@@ -1542,8 +1780,10 @@ std::map<std::string, GstStructure *> OpenVINOImageInference::GetModelInfoPostpr
     return info;
 }
 
-std::map<std::string, GstStructure *> OpenVINOImageInference::GetModelInfoPreproc(const std::string model_file) {
-    auto info = OpenVinoNewApiImpl::get_model_info_preproc(model_file);
+std::map<std::string, GstStructure *> OpenVINOImageInference::GetModelInfoPreproc(const std::string model_file,
+                                                                                  const gchar *pre_proc_config,
+                                                                                  const gchar *ov_extension_lib) {
+    auto info = OpenVinoNewApiImpl::get_model_info_preproc(model_file, pre_proc_config, ov_extension_lib);
     return info;
 }
 
@@ -1562,7 +1802,7 @@ void OpenVINOImageInference::Flush() {
         if (request->buffers.size() > 0) {
             try {
                 // WA: Fill non-complete batch with last element. Can be removed once supported in OV
-                if (batch_size > 1 && !DoNeedImagePreProcessing()) {
+                if (batch_size > 1 && !DoNeedImagePreProcessing(nullptr)) {
                     size_t input_idx = 0;
                     for (auto &input_vec : request->in_tensors) {
                         for (int i = input_vec.size(); i < batch_size; i++)

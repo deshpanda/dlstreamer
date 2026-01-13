@@ -1,5 +1,5 @@
 /*******************************************************************************
- * Copyright (C) 2022-2024 Intel Corporation
+ * Copyright (C) 2022-2025 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  ******************************************************************************/
@@ -82,6 +82,7 @@ class GstDlsTransform {
         auto *self = reinterpret_cast<GstPodData *>(instance);
 
         gpointer instance_memory = g_type_instance_get_private(instance, G_TYPE_FROM_INSTANCE(instance));
+        // This won't be converted to shared ptr because of memory placement
         self->instance = new (instance_memory) GstDlsTransform(&self->base, g_class);
 
         // Set chain_list function to process GstBuffer batch passes as buffer list
@@ -112,7 +113,9 @@ class GstDlsTransform {
         _parent_class = GST_BASE_TRANSFORM_CLASS(g_type_class_peek_parent(_class_data));
         _logger = log::init_logger(GST_CAT_DEFAULT, nullptr);
         _gst_context = std::make_shared<GSTContext>(&base->element);
+#if !(_MSC_VER)
         _gst_mapper = std::make_shared<MemoryMapperAnyToGST>(nullptr, _gst_context);
+#endif
         //_gst_mapper = std::make_shared<MemoryMapperCache>(_gst_mapper);
         if (_class_data->desc->params) {
             for (auto const &param : *_class_data->desc->params) {
@@ -597,12 +600,12 @@ void GstDlsTransformClass::init(gpointer g_class, gpointer class_data) {
     GstElementClass *element_class = GST_ELEMENT_CLASS(g_class);
 
     // input caps
-    GstCaps *input_caps = frame_info_vector_to_gst_caps(desc->input_info);
+    GstCaps *input_caps = frame_info_vector_to_gst_caps(desc->input_info());
     GstPadTemplate *sink_template = gst_pad_template_new("sink", GST_PAD_SINK, GST_PAD_ALWAYS, input_caps);
     gst_element_class_add_pad_template(element_class, sink_template);
 
     // output caps
-    GstCaps *output_caps = frame_info_vector_to_gst_caps(desc->output_info);
+    GstCaps *output_caps = frame_info_vector_to_gst_caps(desc->output_info());
     GstPadTemplate *src_template = gst_pad_template_new("src", GST_PAD_SRC, GST_PAD_ALWAYS, output_caps);
     gst_element_class_add_pad_template(element_class, src_template);
 
@@ -664,11 +667,11 @@ static const GTypeInfo gst_dls_transform_type_info = {.class_size = sizeof(GstDl
 ///////////////////////////////////////////////////////////////////////////////////////
 
 gboolean register_element_gst_plugin(const dlstreamer::ElementDesc *element, GstPlugin *plugin) {
-    // make sure Intel® Deep Learning Streamer (Intel® DL Streamer) metadata registered
+    // make sure Deep Learning Streamer (DL Streamer) metadata registered
     gst_gva_tensor_meta_get_info();
     gst_gva_tensor_meta_api_get_type();
 
-    // register Intel® DL Streamer element as GStreamer element
+    // register DL Streamer element as GStreamer element
     GTypeInfo type_info = dlstreamer::gst_dls_transform_type_info;
     type_info.class_data = element;
     GType gtype = g_type_register_static(GST_TYPE_BASE_TRANSFORM, element->name.data(), &type_info, (GTypeFlags)0);

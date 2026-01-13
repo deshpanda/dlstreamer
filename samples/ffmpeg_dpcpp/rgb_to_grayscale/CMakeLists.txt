@@ -1,16 +1,23 @@
 # ==============================================================================
-# Copyright (C) 2018-2024 Intel Corporation
+# Copyright (C) 2018-2025 Intel Corporation
 #
 # SPDX-License-Identifier: MIT
 # ==============================================================================
 
-cmake_minimum_required(VERSION 3.12)
+cmake_minimum_required(VERSION 3.20)
 
 set (TARGET_NAME "ffmpeg_dpcpp_rgb_to_grayscale")
 
 find_package(PkgConfig REQUIRED)
 pkg_check_modules(LIBAV libavformat libavcodec libswscale libavutil)
-pkg_check_modules(LIBVA libva libva-drm)
+pkg_check_modules(LIBVA libva)
+
+if(UNIX)
+    # On Linux, we need to link against the DRM library for VA-API
+    # This is required for Intel GPUs
+    pkg_check_modules(LIBVA libva-drm)
+endif()
+
 pkg_check_modules(LEVEL_ZERO libze_loader)
 find_package(gflags)
 execute_process(COMMAND which icpx RESULT_VARIABLE status OUTPUT_VARIABLE out OUTPUT_QUIET)
@@ -26,7 +33,7 @@ string(REPLACE "-pie" "" CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS}")
 if (CMAKE_BUILD_TYPE STREQUAL "Debug")
     set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -Wno-debug-disables-optimization -Rno-debug-disables-optimization -Wno-unknown-warning-option")
 endif()
-#set(CMAKE_CXX_STANDARD 17)
+#set(CMAKE_CXX_STANDARD 23)
 
 add_executable(${TARGET_NAME} rgb_to_grayscale.cpp)
 

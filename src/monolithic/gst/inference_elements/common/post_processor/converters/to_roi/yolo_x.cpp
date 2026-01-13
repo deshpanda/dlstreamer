@@ -1,5 +1,5 @@
 /*******************************************************************************
- * Copyright (C) 2024 Intel Corporation
+ * Copyright (C) 2024-2025 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  ******************************************************************************/
@@ -81,11 +81,11 @@ void YOLOxConverter::parseOutputBlob(const float *data, const std::vector<size_t
                                                  BlobToMetaConverter::getLabelByLabelId(main_class), 1.0f / input_width,
                                                  1.0f / input_height, true));
             } // height loop
-        }     // width  loop
-    }         // stride loop
+        } // width  loop
+    } // stride loop
 }
 
-TensorsTable YOLOxConverter::convert(const OutputBlobs &output_blobs) const {
+TensorsTable YOLOxConverter::convert(const OutputBlobs &output_blobs) {
     ITT_TASK(__FUNCTION__);
     try {
         const auto &model_input_image_info = getModelInputImageInfo();

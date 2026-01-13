@@ -1,5 +1,5 @@
 /*******************************************************************************
- * Copyright (C) 2018-2022 Intel Corporation
+ * Copyright (C) 2018-2025 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  ******************************************************************************/
@@ -86,21 +86,19 @@ extern "C" {
 ElementDesc opencv_warp_affine = {.name = "opencv_warp_affine",
                                   .description = "Rotation using cv::warpAffine",
                                   .author = "Intel Corporation",
-                                  &params_desc,
-                                  .input_info =
-                                      {
-                                          {ImageFormat::RGB, MemoryType::VAAPI},
-                                          {ImageFormat::BGR, MemoryType::VAAPI},
-                                          {ImageFormat::RGBX, MemoryType::VAAPI},
-                                          {ImageFormat::BGRX, MemoryType::VAAPI},
-                                      },
-                                  .output_info =
-                                      {
-                                          {ImageFormat::RGB, MemoryType::DMA},
-                                          {ImageFormat::BGR, MemoryType::DMA},
-                                          {ImageFormat::RGBX, MemoryType::DMA},
-                                          {ImageFormat::BGRX, MemoryType::DMA},
-                                      },
+                                  .params = &params_desc,
+                                  .input_info = MAKE_FRAME_INFO_VECTOR({
+                                      {ImageFormat::RGB, MemoryType::VAAPI},
+                                      {ImageFormat::BGR, MemoryType::VAAPI},
+                                      {ImageFormat::RGBX, MemoryType::VAAPI},
+                                      {ImageFormat::BGRX, MemoryType::VAAPI},
+                                  }),
+                                  .output_info = MAKE_FRAME_INFO_VECTOR({
+                                      {ImageFormat::RGB, MemoryType::DMA},
+                                      {ImageFormat::BGR, MemoryType::DMA},
+                                      {ImageFormat::RGBX, MemoryType::DMA},
+                                      {ImageFormat::BGRX, MemoryType::DMA},
+                                  }),
                                   .create = create_element<OpenCvWarpAffine>,
                                   .flags = 0};
 }

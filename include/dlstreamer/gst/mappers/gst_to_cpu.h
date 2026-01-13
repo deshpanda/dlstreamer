@@ -1,5 +1,5 @@
 /*******************************************************************************
- * Copyright (C) 2022 Intel Corporation
+ * Copyright (C) 2022-2025 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  ******************************************************************************/
@@ -85,7 +85,7 @@ class MemoryMapperGSTToCPU : public BaseMemoryMapper {
     FramePtr map_video(GstFramePtr src, AccessMode mode) {
         // Add GST_VIDEO_FRAME_MAP_FLAG_NO_REF to not increment/decrement GstBuffer ref-count during map/unmap
         GstMapFlags map_flags = mode_to_gst_map_flags(mode);
-        map_flags = static_cast<GstMapFlags>(map_flags | GST_VIDEO_FRAME_MAP_FLAG_NO_REF);
+        map_flags = static_cast<GstMapFlags>((unsigned)map_flags | (unsigned)GST_VIDEO_FRAME_MAP_FLAG_NO_REF);
 
         auto frame_ptr = std::make_shared<GstVideoFrame>();
         GstVideoFrame *frame = frame_ptr.get();
@@ -112,16 +112,6 @@ class MemoryMapperGSTToCPU : public BaseMemoryMapper {
             tensors[i] = std::make_shared<CPUTensor>(info.tensors[i], data);
         }
         auto dst = new BaseFrame(info.media_type, info.format, tensors);
-
-#ifdef ENABLE_VPUX // also get DMA FD
-        GstMemory *mem = gst_buffer_peek_memory(src->gst_buffer(), 0);
-        if (!mem)
-            throw std::runtime_error("Failed to get GstBuffer memory");
-        if (gst_is_dmabuf_memory(mem)) {
-            int dma_fd = gst_dmabuf_memory_get_fd(mem.get());
-            set_handle("dma_fd", dma_fd);
-        }
-#endif
         auto deleter = [frame_ptr](BaseFrame *dst) {
             gst_video_frame_unmap(frame_ptr.get());
             delete dst;

@@ -1,5 +1,5 @@
 /*******************************************************************************
- * Copyright (C) 2018-2024 Intel Corporation
+ * Copyright (C) 2018-2025 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  ******************************************************************************/
@@ -33,6 +33,8 @@ void attach_gvaluearray_to_json(const GVA::Tensor &tensor, const std::string &fi
 
     if (!connections_data_array.is_null())
         jobject.push_back(json::object_t::value_type(fieldname, connections_data_array));
+
+    g_value_array_free(valueArray);
 }
 
 void convert_keypoints_fields(const GVA::Tensor &tensor, json &jobject) {
@@ -86,6 +88,11 @@ json convert_tensor(const GVA::Tensor &s_tensor) {
     json data_array;
     if (s_tensor.precision() == GVA::Tensor::Precision::U8) {
         const std::vector<uint8_t> data = s_tensor.data<uint8_t>();
+        for (const auto &val : data) {
+            data_array += val;
+        }
+    } else if (s_tensor.precision() == GVA::Tensor::Precision::I64) {
+        const std::vector<int64_t> data = s_tensor.data<int64_t>();
         for (const auto &val : data) {
             data_array += val;
         }

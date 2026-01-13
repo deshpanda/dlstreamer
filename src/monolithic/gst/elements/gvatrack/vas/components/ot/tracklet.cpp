@@ -1,5 +1,5 @@
 /*******************************************************************************
- * Copyright (C) 2018-2022 Intel Corporation
+ * Copyright (C) 2018-2025 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  ******************************************************************************/
@@ -49,7 +49,7 @@ void Tracklet::RenewTrajectory(const cv::Rect2f &bounding_box) {
     __##var_name << value;                                                                                             \
     std::string var_name = __##var_name.str();
 
-#define ROUND_F(value, scale) (round((value)*scale) / scale)
+#define ROUND_F(value, scale) (round((value) * (scale)) / (scale))
 
 std::string Tracklet::Serialize() const {
 #ifdef DUMP_OTAV
@@ -123,7 +123,7 @@ void ZeroTermImagelessTracklet::RenewTrajectory(const cv::Rect2f &bounding_box) 
                           bounding_box.height);
 
     ClearTrajectory();
-    kalman_filter.reset(new KalmanFilterNoOpencv(bounding_box));
+    kalman_filter = std::make_unique<KalmanFilterNoOpencv>(bounding_box);
     kalman_filter->Predict();
     kalman_filter->Correct(rect_predict);
 
@@ -144,7 +144,7 @@ void ShortTermImagelessTracklet::RenewTrajectory(const cv::Rect2f &bounding_box)
                           bounding_box.height);
 
     ClearTrajectory();
-    kalman_filter.reset(new KalmanFilterNoOpencv(bounding_box));
+    kalman_filter = std::make_unique<KalmanFilterNoOpencv>(bounding_box);
     kalman_filter->Predict();
     kalman_filter->Correct(rect_predict);
 

@@ -1,39 +1,49 @@
 # ==============================================================================
-# Copyright (C) 2018 Intel Corporation
+# Copyright (C) 2018-2025 Intel Corporation
 #
 # SPDX-License-Identifier: MIT
 # ==============================================================================
 
-add_subdirectory(itt)
+include(FetchContent)
 
-
-
-# Populate thirdparty/json dependency
-set(JSONCONVERT_SOURCE "https://github.com/nlohmann/json/releases/download/v3.7.3/json.hpp")
-set(JSONCONVERT_PATH "${CMAKE_CURRENT_SOURCE_DIR}/json/nlohmann")
-set(JSONCONVERT_HEADER "${JSONCONVERT_PATH}/json.hpp")
-set(JSONVALIDATOR_SOURCE "https://github.com/pboettch/json-schema-validator/archive/2.0.0.tar.gz")
-set(JSONVALIDATOR_PATH "${CMAKE_CURRENT_SOURCE_DIR}/json/pboettch")
-set(JSONVALIDATOR_TAR "${JSONVALIDATOR_PATH}/jsonvalidator.tar.gz")
-set(JSONVALIDATOR_HEADER "${JSONVALIDATOR_PATH}/json-schema-validator-2.0.0/src/json-schema.hpp")
-
-download_and_verify(${JSONCONVERT_SOURCE} ${JSONCONVERT_HEADER} "JSON header")
-
-if(NOT EXISTS ${JSONVALIDATOR_HEADER})
-    download_and_verify(${JSONVALIDATOR_SOURCE} ${JSONVALIDATOR_TAR} "JSON validator")
-
-    execute_process(
-        COMMAND ${CMAKE_COMMAND} -E tar xzf ${JSONVALIDATOR_TAR}
-        WORKING_DIRECTORY ${JSONVALIDATOR_PATH}
-    )
-    # fix build issue
-    execute_process(
-        COMMAND sed -i "s/&c : s/c : s/g" json-schema-validator-2.0.0/src/json-validator.cpp
-        WORKING_DIRECTORY ${JSONVALIDATOR_PATH}
-    )
+# Support DOWNLOAD_EXTRACT_TIMESTAMP in CMake 3.24:
+if (CMAKE_VERSION VERSION_GREATER_EQUAL "3.24.0")
+    cmake_policy(SET CMP0135 NEW)
 endif()
 
-add_subdirectory(json)
+add_subdirectory(itt)
+
+if(${ENABLE_TESTS})
+    if (EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/googletest/CMakeLists.txt)
+        message("Using thirdparty/googletest")
+        add_subdirectory(googletest)
+    else()
+        find_package(GTest) # sudo apt install libgtest-dev libgmock-dev
+        if (GTest_FOUND AND GTest_VERSION VERSION_GREATER_EQUAL "1.10")
+            message(STATUS "Found GTest: version ${GTest_VERSION}")
+            include_directories(${GTEST_INCLUDE_DIRS})
+        else()
+            message("GTest library not found, skipping tests build")
+            SET(ENABLE_TESTS OFF CACHE BOOL "Parameter to enable tests building" FORCE)
+        endif()
+    endif()
+    
+    FetchContent_Declare(
+        fff
+        URL https://github.com/meekrosoft/fff/archive/5111c61e1ef7848e3afd3550044a8cf4405f4199.zip
+    )
+    FetchContent_MakeAvailable(fff)
+endif()
+
+# Populate json dependency
+set(nlohmann_json_VERSION v3.12.0)
+FetchContent_Declare(
+    json_schema_validator
+    URL https://github.com/pboettch/json-schema-validator/archive/2.4.0.tar.gz
+)
+FetchContent_MakeAvailable(json_schema_validator)
+add_library(json-hpp ALIAS nlohmann_json)
+add_library(json-schema-validator ALIAS nlohmann_json_schema_validator)
 
 # Hint compiler about location of the header file generated.
 include_directories(${CMAKE_CURRENT_BINARY_DIR})

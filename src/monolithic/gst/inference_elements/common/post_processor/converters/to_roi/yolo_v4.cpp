@@ -1,5 +1,5 @@
 /*******************************************************************************
- * Copyright (C) 2024 Intel Corporation
+ * Copyright (C) 2024-2025 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  ******************************************************************************/
@@ -27,7 +27,7 @@ void YOLOv4Converter::parseOutputBlob(const float *blob_data, const std::vector<
     size_t _W = blob_dims[desc.Cx];
     size_t _H = blob_dims[desc.Cy];
 
-    float _transposed_blob_data[blob_size] = {0};
+    std::vector<float> _transposed_blob_data(blob_size, 0.0f);
 
     size_t offset_nhwc = 0; // n * HWC + h * WC + w * C + c
     size_t offset_nchw = 0; // n * CHW + c * HW + h * W + w
@@ -44,5 +44,5 @@ void YOLOv4Converter::parseOutputBlob(const float *blob_data, const std::vector<
         }
     }
 
-    YOLOv3Converter::parseOutputBlob(_transposed_blob_data, blob_dims, blob_size, objects);
+    YOLOv3Converter::parseOutputBlob(_transposed_blob_data.data(), blob_dims, blob_size, objects);
 }

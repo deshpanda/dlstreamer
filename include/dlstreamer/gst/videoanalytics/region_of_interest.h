@@ -1,5 +1,5 @@
 /*******************************************************************************
- * Copyright (C) 2018-2024 Intel Corporation
+ * Copyright (C) 2018-2025 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  ******************************************************************************/
@@ -12,6 +12,7 @@
 
 #pragma once
 
+#include "../metadata/gstanalyticskeypointsmtd.h"
 #include "tensor.h"
 
 #include <cstdint>
@@ -20,6 +21,7 @@
 #include <gst/video/gstvideometa.h>
 
 #include <cassert>
+#include <memory>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -49,16 +51,14 @@ class RegionOfInterest {
      * @return Bounding box coordinates of the RegionOfInterest
      */
     Rect<uint32_t> rect() const {
-        if (_gst_meta) {
-            return {_gst_meta->x, _gst_meta->y, _gst_meta->w, _gst_meta->h};
-        }
-
         gint x;
         gint y;
         gint w;
         gint h;
+        gfloat r;
 
-        if (!gst_analytics_od_mtd_get_location(const_cast<GstAnalyticsODMtd *>(&_od_meta), &x, &y, &w, &h, nullptr)) {
+        if (!gst_analytics_od_mtd_get_oriented_location(const_cast<GstAnalyticsODMtd *>(&_od_meta), &x, &y, &w, &h, &r,
+                                                        nullptr)) {
             throw std::runtime_error("Error when trying to read the location of the RegionOfInterest");
         }
         return {static_cast<uint32_t>(x), static_cast<uint32_t>(y), static_cast<uint32_t>(w), static_cast<uint32_t>(h)};
@@ -69,7 +69,6 @@ class RegionOfInterest {
      * @return Bounding box coordinates of the RegionOfInterest
      */
     Rect<double> normalized_rect() {
-        assert(_gst_meta != nullptr);
         Tensor det = detection();
         return {det.get_double("x_min"), det.get_double("y_min"), det.get_double("x_max") - det.get_double("x_min"),
                 det.get_double("y_max") - det.get_double("y_min")};
@@ -79,8 +78,17 @@ class RegionOfInterest {
      * @brief Get RegionOfInterest bounding box rotation
      * @return Bounding box rotation of the RegionOfInterest
      */
-    double rotation() const {
-        return _detection ? _detection->get_double("rotation", 0.0) : 0.0;
+    float rotation() const {
+        gint x;
+        gint y;
+        gint w;
+        gint h;
+        gfloat rotation;
+
+        if (!gst_analytics_od_mtd_get_oriented_location(&_od_meta, &x, &y, &w, &h, &rotation, nullptr)) {
+            throw std::runtime_error("Error when trying to read the rotation of the RegionOfInterest");
+        }
+        return rotation;
     }
 
     /**
@@ -88,24 +96,16 @@ class RegionOfInterest {
      * @return RegionOfInterest label
      */
     std::string label() const {
-        if (_gst_meta) {
-            const char *str = g_quark_to_string(_gst_meta->roi_type);
-            return std::string(str ? str : "");
-        }
-
         GQuark label = gst_analytics_od_mtd_get_obj_type(const_cast<GstAnalyticsODMtd *>(&_od_meta));
         return label ? g_quark_to_string(label) : "";
     }
 
     /**
      * @brief Get RegionOfInterest detection confidence (set by gvadetect)
-     * @return last added detection Tensor confidence if exists, otherwise 0.0
+     * @return detection confidence from analytics metadata
+     * @throws std::runtime_error if confidence cannot be read from metadata
      */
     double confidence() const {
-        if (_gst_meta) {
-            return _detection ? _detection->confidence() : 0.0;
-        }
-
         gfloat conf;
         if (!gst_analytics_od_mtd_get_confidence_lvl(const_cast<GstAnalyticsODMtd *>(&_od_meta), &conf)) {
             throw std::runtime_error("Error when trying to read the confidence of the RegionOfInterest");
@@ -118,16 +118,20 @@ class RegionOfInterest {
      * @return Unique id, or zero value if not found
      */
     int32_t object_id() const {
-        if (_gst_meta) {
-            GstStructure *object_id_struct = gst_video_region_of_interest_meta_get_param(_gst_meta, "object_id");
-            if (!object_id_struct)
-                return 0;
-            int id = 0;
-            gst_structure_get_int(object_id_struct, "id", &id);
+        GstAnalyticsTrackingMtd trk_mtd;
+        if (gst_analytics_relation_meta_get_direct_related(_od_meta.meta, _od_meta.id, GST_ANALYTICS_REL_TYPE_ANY,
+                                                           gst_analytics_tracking_mtd_get_mtd_type(), nullptr,
+                                                           &trk_mtd)) {
+            guint64 id;
+            GstClockTime tracking_first_seen, tracking_last_seen;
+            gboolean tracking_lost;
+            if (!gst_analytics_tracking_mtd_get_info(&trk_mtd, &id, &tracking_first_seen, &tracking_last_seen,
+                                                     &tracking_lost)) {
+                throw std::runtime_error("Failed to get tracking mtd info");
+            }
+
             return id;
         }
-
-        // TODO - where do we use object_id?
         return 0;
     }
 
@@ -140,20 +144,33 @@ class RegionOfInterest {
     }
 
     /**
-     * @brief Add new tensor (inference result) to this RegionOfInterest with name set. To add detection tensor, set
-     * name to "detection"
-     * @param name name for the tensor. If name is set to "detection", detection Tensor will be created and set for this
-     * RegionOfInterest
-     * @return just created Tensor object, which can be filled with tensor information further
+     * @brief Add new tensor (inference result) to this RegionOfInterest
+     * @param tensor Tensor object to add to this RegionOfInterest
      */
-    Tensor add_tensor(const std::string &name) {
-        GstStructure *tensor = gst_structure_new_empty(name.c_str());
-        gst_video_region_of_interest_meta_add_param(_gst_meta, tensor);
+    void add_tensor(const Tensor &tensor) {
+        GstStructure *s = tensor.gst_structure();
+        if (!s) {
+            throw std::invalid_argument("GVA::RegionOfInterest::add_tensor: tensor structure is nullptr");
+        }
+        gst_video_region_of_interest_meta_add_param(_gst_meta, s);
+
+        GstAnalyticsMtd tensor_mtd;
+        if (tensor.convert_to_meta(&tensor_mtd, &_od_meta, _od_meta.meta)) {
+            if (!gst_analytics_relation_meta_set_relation(_od_meta.meta, GST_ANALYTICS_REL_TYPE_CONTAIN, _od_meta.id,
+                                                          tensor_mtd.id)) {
+                throw std::runtime_error(
+                    "Failed to set relation between object detection metadata and tensor metadata");
+            }
+            if (!gst_analytics_relation_meta_set_relation(_od_meta.meta, GST_ANALYTICS_REL_TYPE_IS_PART_OF,
+                                                          tensor_mtd.id, _od_meta.id)) {
+                throw std::runtime_error(
+                    "Failed to set relation between tensor metadata and object detection metadata");
+            }
+        }
+
         _tensors.emplace_back(tensor);
         if (_tensors.back().is_detection())
             _detection = &_tensors.back();
-
-        return _tensors.back();
     }
 
     /**
@@ -166,8 +183,10 @@ class RegionOfInterest {
      * this method was called
      */
     Tensor detection() {
-        if (_gst_meta && !_detection) {
-            add_tensor("detection");
+        if (!_detection) {
+            GstStructure *gst_structure = gst_structure_new_empty("detection");
+            Tensor detection_tensor(gst_structure);
+            add_tensor(detection_tensor);
         }
         return _detection ? *_detection : nullptr;
     }
@@ -177,15 +196,33 @@ class RegionOfInterest {
      * @return last added detection Tensor label_id if exists, otherwise 0
      */
     int label_id() const {
-        return _detection ? _detection->label_id() : 0;
+        GQuark label = gst_analytics_od_mtd_get_obj_type(const_cast<GstAnalyticsODMtd *>(&_od_meta));
+        if (label) {
+            GstAnalyticsClsMtd cls_descriptor_mtd;
+            if (!gst_analytics_relation_meta_get_direct_related(
+                    _od_meta.meta, _od_meta.id, GST_ANALYTICS_REL_TYPE_RELATE_TO, gst_analytics_cls_mtd_get_mtd_type(),
+                    nullptr, &cls_descriptor_mtd)) {
+                return 0;
+            }
+
+            gint label_id = gst_analytics_cls_mtd_get_index_by_quark(&cls_descriptor_mtd, label);
+            if (label_id < 0) {
+                throw std::runtime_error("Error when trying to read the label id of the RegionOfInterest");
+            }
+            return label_id;
+        } else {
+            return 0;
+        }
     }
 
     /**
-     * @brief Construct RegionOfInterest instance from GstVideoRegionOfInterestMeta. After this, RegionOfInterest will
-     * obtain all tensors (detection & inference results) from GstVideoRegionOfInterestMeta
-     * @param meta GstVideoRegionOfInterestMeta containing bounding box information and tensors
+     * @brief Construct RegionOfInterest from analytics metadata and video metadata
+     * @param od_meta Object detection analytics metadata
+     * @param meta Video region of interest metadata containing additional parameters
      */
-    RegionOfInterest(GstVideoRegionOfInterestMeta *meta) : _gst_meta(meta), _detection(nullptr) {
+    RegionOfInterest(GstAnalyticsODMtd od_meta, GstVideoRegionOfInterestMeta *meta)
+        : _gst_meta(meta), _detection(nullptr), _od_meta(od_meta) {
+
         if (not _gst_meta)
             throw std::invalid_argument("GVA::RegionOfInterest: meta is nullptr");
 
@@ -193,15 +230,27 @@ class RegionOfInterest {
 
         for (GList *l = meta->params; l; l = g_list_next(l)) {
             GstStructure *s = GST_STRUCTURE(l->data);
-            if (not gst_structure_has_name(s, "object_id")) {
+            const char *type = gst_structure_get_string(s, "type");
+            if (not gst_structure_has_name(s, "object_id") && not gst_structure_has_name(s, "keypoints") &&
+                (type == nullptr || strcmp(type, "classification_result") != 0)) {
                 _tensors.emplace_back(s);
                 if (_tensors.back().is_detection())
                     _detection = &_tensors.back();
             }
         }
-    }
 
-    RegionOfInterest(GstAnalyticsODMtd meta) : _gst_meta(nullptr), _detection(nullptr), _od_meta(meta) {
+        // append tensors converted from metadata
+        gpointer state = NULL;
+        GstAnalyticsMtd handle;
+        while (gst_analytics_relation_meta_get_direct_related(od_meta.meta, od_meta.id, GST_ANALYTICS_REL_TYPE_CONTAIN,
+                                                              GST_ANALYTICS_MTD_TYPE_ANY, &state, &handle)) {
+            GstStructure *s = GVA::Tensor::convert_to_tensor(handle);
+            if (s != nullptr) {
+                auto shared_s = std::shared_ptr<GstStructure>(s, gst_structure_free);
+                _tensors.emplace_back(s);
+                _converted_structures.push_back(shared_s);
+            }
+        }
     }
 
     /**
@@ -211,19 +260,22 @@ class RegionOfInterest {
      * @return ID field value
      */
     int region_id() {
-        if (_gst_meta) {
-            return _gst_meta->id;
-        }
         return _od_meta.id;
     }
 
     /**
-     * @brief Set RegionOfInterest label
-     * @param label Label to set
+     * @brief Retrieves the parent object detection ID for this region of interest.
+     * @return The ID of the parent object detection metadata if found, -1 otherwise.
      */
-    void set_label(std::string label) {
-        assert(_gst_meta != nullptr);
-        _gst_meta->roi_type = g_quark_from_string(label.c_str());
+    int parent_id() {
+        GstAnalyticsODMtd rlt_mtd;
+        if (gst_analytics_relation_meta_get_direct_related(_od_meta.meta, _od_meta.id,
+                                                           GST_ANALYTICS_REL_TYPE_IS_PART_OF,
+                                                           gst_analytics_od_mtd_get_mtd_type(), nullptr, &rlt_mtd)) {
+            return rlt_mtd.id;
+        } else {
+            return -1;
+        }
     }
 
     /**
@@ -231,13 +283,74 @@ class RegionOfInterest {
      * @param id ID to set
      */
     void set_object_id(int32_t id) {
-        assert(_gst_meta != nullptr);
-        GstStructure *object_id = gst_video_region_of_interest_meta_get_param(_gst_meta, "object_id");
-        if (object_id) {
-            gst_structure_set(object_id, "id", G_TYPE_INT, id, NULL);
-        } else {
-            object_id = gst_structure_new("object_id", "id", G_TYPE_INT, id, NULL);
-            gst_video_region_of_interest_meta_add_param(_gst_meta, object_id);
+        if (_gst_meta) {
+            GstStructure *object_id = gst_video_region_of_interest_meta_get_param(_gst_meta, "object_id");
+            if (object_id) {
+                gst_structure_set(object_id, "id", G_TYPE_INT, id, NULL);
+            } else {
+                object_id = gst_structure_new("object_id", "id", G_TYPE_INT, id, NULL);
+                gst_video_region_of_interest_meta_add_param(_gst_meta, object_id);
+            }
+        }
+
+        gpointer state = nullptr;
+        GstAnalyticsTrackingMtd trk_mtd;
+        while (gst_analytics_relation_meta_get_direct_related(_od_meta.meta, _od_meta.id, GST_ANALYTICS_REL_TYPE_ANY,
+                                                              gst_analytics_tracking_mtd_get_mtd_type(), &state,
+                                                              &trk_mtd)) {
+            if (!gst_analytics_relation_meta_set_relation(_od_meta.meta, GST_ANALYTICS_REL_TYPE_NONE, _od_meta.id,
+                                                          trk_mtd.id)) {
+                throw std::runtime_error("Failed to remove relation between od meta and tracking meta");
+            }
+        }
+
+        if (!gst_analytics_relation_meta_add_tracking_mtd(_od_meta.meta, id, 0, &trk_mtd)) {
+            throw std::runtime_error("Failed to add tracking metadata");
+        }
+
+        if (!gst_analytics_relation_meta_set_relation(_od_meta.meta, GST_ANALYTICS_REL_TYPE_RELATE_TO, _od_meta.id,
+                                                      trk_mtd.id)) {
+            throw std::runtime_error("Failed to set relation between od meta and tracking meta");
+        }
+    }
+
+    /**
+     * @brief Get list of parameters attached to this RegionOfInterest
+     * @return GList pointer to parameters
+     */
+    GList *get_params() const {
+        return _gst_meta->params;
+    }
+
+    /**
+     * @brief Get parameter by name from this RegionOfInterest
+     * @param name Name of the parameter to retrieve
+     * @return GstStructure pointer to the parameter, or nullptr if not found
+     */
+    GstStructure *get_param(const char *name) const {
+        return gst_video_region_of_interest_meta_get_param(_gst_meta, name);
+    }
+
+    /**
+     * @brief Add parameter structure to this RegionOfInterest
+     * @param s GstStructure to add as parameter
+     */
+    void add_param(GstStructure *s) {
+        gst_video_region_of_interest_meta_add_param(_gst_meta, s);
+
+        GVA::Tensor tensor(s);
+        GstAnalyticsMtd tensor_mtd;
+        if (tensor.convert_to_meta(&tensor_mtd, &_od_meta, _od_meta.meta)) {
+            if (!gst_analytics_relation_meta_set_relation(_od_meta.meta, GST_ANALYTICS_REL_TYPE_CONTAIN, _od_meta.id,
+                                                          tensor_mtd.id)) {
+                throw std::runtime_error(
+                    "Failed to set relation between object detection metadata and tensor metadata");
+            }
+            if (!gst_analytics_relation_meta_set_relation(_od_meta.meta, GST_ANALYTICS_REL_TYPE_IS_PART_OF,
+                                                          tensor_mtd.id, _od_meta.id)) {
+                throw std::runtime_error(
+                    "Failed to set relation between tensor metadata and object detection metadata");
+            }
         }
     }
 
@@ -252,9 +365,9 @@ class RegionOfInterest {
 
   protected:
     /**
-     * @brief GstVideoRegionOfInterestMeta containing fields filled with detection result (produced by gvadetect element
-     * in Gstreamer pipeline) and all the additional tensors, describing detection and other inference results (produced
-     * by gvainference, gvadetect, gvaclassify in Gstreamer pipeline)
+     * @brief GstVideoRegionOfInterestMeta containing fields filled with detection result (produced by gvadetect
+     * element in Gstreamer pipeline) and all the additional tensors, describing detection and other inference
+     * results (produced by gvainference, gvadetect, gvaclassify in Gstreamer pipeline)
      */
     GstVideoRegionOfInterestMeta *_gst_meta;
     /**
@@ -262,14 +375,20 @@ class RegionOfInterest {
      * obtained from GstVideoRegionOfInterestMeta
      */
     std::vector<Tensor> _tensors;
+
+    /**
+     * @brief vector of GstStructure shared pointers that were allocated by convert_to_tensor.
+     */
+    std::vector<std::shared_ptr<GstStructure>> _converted_structures;
+
     /**
      * @brief last added detection Tensor instance, defined as Tensor with name set to "detection"
      */
     Tensor *_detection;
 
     /**
-     * @brief handle containing data required to use gst_analytics_od_mtd APIs, to retrieve analytics data related to
-     * that region of interest.
+     * @brief handle containing data required to use gst_analytics_od_mtd APIs, to retrieve analytics data related
+     * to that region of interest.
      */
     GstAnalyticsODMtd _od_meta;
 };

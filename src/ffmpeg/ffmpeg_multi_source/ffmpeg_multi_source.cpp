@@ -1,5 +1,5 @@
 /*******************************************************************************
- * Copyright (C) 2022-2024 Intel Corporation
+ * Copyright (C) 2022-2025 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  ******************************************************************************/
@@ -72,7 +72,7 @@ class MultiSourceFFMPEG : public BaseSource {
         // Create thread with frame reading loop
         size_t stream_id = _streams.size();
         _streams.push_back({});
-        _streams.back().thread = std::thread([=] {
+        _streams.back().thread = std::thread([=, this] {
             int64_t timestamp = 0;
             _streams[stream_id].active = true;
             while (_streams[stream_id].active) {
@@ -164,8 +164,8 @@ DLS_EXPORT ElementDesc ffmpeg_multi_source = {.name = "ffmpeg_multi_source",
                                               .description = "Multi video-stream source element based on FFmpeg",
                                               .author = "Intel Corporation",
                                               .params = nullptr,
-                                              .input_info = {},
-                                              .output_info = {{MediaType::Image}},
+                                              .input_info = MAKE_FRAME_INFO_VECTOR({}),
+                                              .output_info = MAKE_FRAME_INFO_VECTOR({{MediaType::Image}}),
                                               .create = create_element<MultiSourceFFMPEG>,
                                               .flags = 0};
 }

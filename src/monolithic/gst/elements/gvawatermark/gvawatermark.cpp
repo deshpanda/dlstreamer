@@ -1,10 +1,11 @@
 /*******************************************************************************
- * Copyright (C) 2021-2024 Intel Corporation
+ * Copyright (C) 2021-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  ******************************************************************************/
 
 #include "gvawatermark.h"
+#include "gstgvawatermarkimpl.h"
 #include "gvawatermarkcaps.h"
 
 #include "scope_guard.h"
@@ -20,8 +21,6 @@ GST_DEBUG_CATEGORY_STATIC(gst_gva_watermark_debug_category);
 #define GST_CAT_DEFAULT gst_gva_watermark_debug_category
 
 #define DEFAULT_DEVICE "CPU"
-
-enum { PROP_0, PROP_DEVICE, PROP_OBB };
 
 G_DEFINE_TYPE_WITH_CODE(GstGvaWatermark, gst_gva_watermark, GST_TYPE_BIN,
                         GST_DEBUG_CATEGORY_INIT(gst_gva_watermark_debug_category, "gvawatermark", 0,
@@ -40,7 +39,6 @@ static GstStateChangeReturn gva_watermark_change_state(GstElement *element, GstS
 static gboolean gst_gva_watermark_sink_event(GstPad *pad, GstObject *parent, GstEvent *event);
 
 namespace {
-
 static const gchar *get_caps_str_with_feature(CapsFeature mem_type) {
     if (mem_type == VA_SURFACE_CAPS_FEATURE)
         return "video/x-raw(" VASURFACE_FEATURE_STR "), format=" WATERMARK_PREFERRED_REMOTE_FORMAT;
@@ -87,16 +85,36 @@ static void gst_gva_watermark_class_init(GstGvaWatermarkClass *klass) {
     gobject_class->get_property = gst_gva_watermark_get_property;
     gobject_class->finalize = gst_gva_watermark_finalize;
 
-    g_object_class_install_property(
-        gobject_class, PROP_DEVICE,
-        g_param_spec_string("device", "Target device", "Deprecated, don't use", DEFAULT_DEVICE,
-                            static_cast<GParamFlags>(G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS | G_PARAM_DEPRECATED)));
+    const auto kDefaultGParamFlags =
+        static_cast<GParamFlags>(G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS | G_PARAM_CONSTRUCT);
+
+    g_object_class_install_property(gobject_class, PROP_DEVICE,
+                                    g_param_spec_string("device", "Target device", "CPU or GPU. Default is CPU.",
+                                                        DEFAULT_DEVICE, kDefaultGParamFlags));
 
     g_object_class_install_property(gobject_class, PROP_OBB,
                                     g_param_spec_boolean("obb", "Oriented Bounding Box",
                                                          "If true, draw oriented bounding box instead of object mask",
-                                                         false,
-                                                         (GParamFlags)(G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS)));
+                                                         false, kDefaultGParamFlags));
+    g_object_class_install_property(
+        gobject_class, PROP_DISPL_AVGFPS,
+        g_param_spec_boolean(
+            "displ-avgfps", "Display Average FPS",
+            "If true, display the average FPS read from gvafpscounter element on the output video, (default false)\n"
+            "\t\t\tThe gvafpscounter element must be present in the pipeline.\n"
+            "\t\t\te.g.: ... ! gvawatermark displ-avgfps=true ! gvafpscounter ! ...",
+            false, kDefaultGParamFlags));
+
+    g_object_class_install_property(
+        gobject_class, PROP_DISPL_CFG,
+        g_param_spec_string("displ-cfg", "Gvawatermark display configuration",
+                            "Comma separated list of KEY=VALUE parameters of displayed notations.\n"
+                            "\t\t\tAvailable options: \n"
+                            "\t\t\tshow-labels=true|false - enable/disable display of text labels (default true)\n"
+                            "\t\t\ttext-scale=<0.1-2.0> - scale factor for text labels (default 1.0)\n"
+                            "\t\t\te.g.: displ-cfg=show-labels=off\n"
+                            "\t\t\te.g.: displ-cfg=text-scale=0.5",
+                            nullptr, kDefaultGParamFlags));
 }
 
 static void gst_gva_watermark_init(GstGvaWatermark *self) {
@@ -149,10 +167,16 @@ static void gst_gva_watermark_init(GstGvaWatermark *self) {
 
     self->active_path = WatermarkPathNone;
     self->preferred_path = WatermarkPathNone;
+    self->block_pad_source = WatermarkPathNone;
     self->is_active_nv12 = false;
     self->device = g_strdup(DEFAULT_DEVICE);
     self->obb = false;
     self->block_probe_id = 0;
+
+    self->use_watermarkimpl_only = true;
+
+    // Forward default device property to watermarkimpl
+    g_object_set(self->watermarkimpl, "device", self->device, nullptr);
 }
 
 void gst_gva_watermark_set_property(GObject *object, guint property_id, const GValue *value, GParamSpec *pspec) {
@@ -169,6 +193,15 @@ void gst_gva_watermark_set_property(GObject *object, guint property_id, const GV
     case PROP_OBB:
         gvawatermark->obb = g_value_get_boolean(value);
         g_object_set(gvawatermark->watermarkimpl, "obb", gvawatermark->obb, nullptr);
+        break;
+    case PROP_DISPL_AVGFPS:
+        gvawatermark->displ_avgfps = g_value_get_boolean(value);
+        g_object_set(gvawatermark->watermarkimpl, "displ-avgfps", gvawatermark->displ_avgfps, nullptr);
+        break;
+    case PROP_DISPL_CFG:
+        g_free(gvawatermark->displ_cfg);
+        gvawatermark->displ_cfg = g_value_dup_string(value);
+        g_object_set(gvawatermark->watermarkimpl, "displ-cfg", gvawatermark->displ_cfg, nullptr);
         break;
     default:
         G_OBJECT_WARN_INVALID_PROPERTY_ID(object, property_id, pspec);
@@ -188,6 +221,12 @@ void gst_gva_watermark_get_property(GObject *object, guint property_id, GValue *
     case PROP_OBB:
         g_value_set_boolean(value, gvawatermark->obb);
         break;
+    case PROP_DISPL_AVGFPS:
+        g_value_set_boolean(value, gvawatermark->displ_avgfps);
+        break;
+    case PROP_DISPL_CFG:
+        g_value_set_string(value, gvawatermark->displ_cfg);
+        break;
     default:
         G_OBJECT_WARN_INVALID_PROPERTY_ID(object, property_id, pspec);
         break;
@@ -206,6 +245,9 @@ void gst_gva_watermark_finalize(GObject *object) {
 
     g_free(gvawatermark->device);
     gvawatermark->device = nullptr;
+
+    g_free(gvawatermark->displ_cfg);
+    gvawatermark->displ_cfg = nullptr;
 
     G_OBJECT_CLASS(gst_gva_watermark_parent_class)->finalize(object);
 }
@@ -228,27 +270,30 @@ static void gva_watermark_block_sink(GstGvaWatermark *self, gboolean enable_bloc
     if (!enable_block && self->block_probe_id == 0)
         return;
 
-    GstPad *pad = gst_element_get_static_pad(self->identity, "sink");
+    GstPad *pad = nullptr;
+    WatermarkPath pad_path = enable_block ? self->active_path : self->block_pad_source;
+
+    if (pad_path == WatermarkPathTransparent) {
+        pad = gst_element_get_static_pad(self->watermarkimpl, "sink");
+    } else {
+        pad = gst_element_get_static_pad(self->identity, "sink");
+    }
+
+    if (!pad)
+        return;
 
     if (enable_block) {
+        self->block_pad_source = pad_path;
         self->block_probe_id = gst_pad_add_probe(pad, GST_PAD_PROBE_TYPE_BLOCK_DOWNSTREAM,
                                                  gva_watermark_sink_block_pad_probe, nullptr, nullptr);
     } else {
         gst_pad_remove_probe(pad, self->block_probe_id);
         self->block_probe_id = 0;
+        self->block_pad_source = WatermarkPathNone;
     }
 
     gst_object_unref(pad);
-    GST_DEBUG_OBJECT(self, "Sink block set to: %d", enable_block);
-}
-
-static gboolean gva_watermark_link_elements(GstGvaWatermark *self, GstElement *src, GstElement *dest) {
-    if (!gst_element_link(src, dest)) {
-        GST_ELEMENT_ERROR(self, RESOURCE, NOT_FOUND,
-                          ("Couldn't link element %s to %s", GST_ELEMENT_NAME(src), GST_ELEMENT_NAME(dest)), (nullptr));
-        return FALSE;
-    }
-    return TRUE;
+    GST_DEBUG_OBJECT(self, "Sink block set to: %d (path=%d)", enable_block, pad_path);
 }
 
 static gboolean gva_watermark_set_src_pad(GstGvaWatermark *self, GstElement *src) {
@@ -271,31 +316,33 @@ CapsFeature get_current_caps_feature(GstGvaWatermark *self) {
     return get_caps_feature(caps);
 }
 
-static gboolean link_videoconvert(GstGvaWatermark *self) {
-    g_assert(self->active_path == WatermarkPathVaVaapi && "Supposed to be called in VA-API or Va path");
+static gboolean G_GNUC_UNUSED link_videoconvert(GstGvaWatermark *self) {
+    g_assert(self->active_path == WatermarkPathVaVaapi && "Supposed to be called in VAAPI path only");
 
-    self->convert = gst_element_factory_make("videoconvert", nullptr);
-    if (!self->convert) {
-        GST_ELEMENT_ERROR(self, CORE, MISSING_PLUGIN, ("GStreamer installation is missing plugin videoconvert"),
-                          (nullptr));
-        return FALSE;
-    }
-    gst_bin_add(GST_BIN(self), self->convert);
-    if (!gst_element_sync_state_with_parent(self->convert)) {
-        GST_ELEMENT_ERROR(self, RESOURCE, NOT_FOUND, ("Couldn't sync videoconvert state with gvawatermark"), (nullptr));
-        return FALSE;
-    }
+    if (self->have_vaapi) {
+        self->convert = gst_element_factory_make("videoconvert", nullptr);
+        if (!self->convert) {
+            GST_ELEMENT_ERROR(self, CORE, MISSING_PLUGIN, ("GStreamer installation is missing plugin videoconvert"),
+                              (nullptr));
+            return FALSE;
+        }
+        gst_bin_add(GST_BIN(self), self->convert);
+        if (!gst_element_sync_state_with_parent(self->convert)) {
+            GST_ELEMENT_ERROR(self, RESOURCE, NOT_FOUND, ("Couldn't sync videoconvert state with gvawatermark"),
+                              (nullptr));
+            return FALSE;
+        }
 
-    gst_element_unlink(self->identity, self->preproc);
-    if (!gst_element_link(self->identity, self->convert) || !gst_element_link(self->convert, self->preproc)) {
-        GST_ERROR_OBJECT(self, "videoconvert cannot be linked");
-        return FALSE;
+        gst_element_unlink(self->identity, self->preproc);
+        if (!gst_element_link(self->identity, self->convert) || !gst_element_link(self->convert, self->preproc)) {
+            GST_ERROR_OBJECT(self, "videoconvert cannot be linked");
+            return FALSE;
+        }
     }
-
     return TRUE;
 }
 
-static gboolean unlink_videoconvert(GstGvaWatermark *self) {
+static G_GNUC_UNUSED gboolean unlink_videoconvert(GstGvaWatermark *self) {
     if (!self->convert || self->active_path != WatermarkPathVaVaapi)
         return TRUE;
 
@@ -310,6 +357,15 @@ static gboolean unlink_videoconvert(GstGvaWatermark *self) {
     gst_bin_remove(GST_BIN(self), self->convert);
     self->convert = nullptr;
 
+    return TRUE;
+}
+
+static gboolean gva_watermark_link_elements(GstGvaWatermark *self, GstElement *src, GstElement *dest) {
+    if (!gst_element_link(src, dest)) {
+        GST_ELEMENT_ERROR(self, RESOURCE, NOT_FOUND,
+                          ("Couldn't link element %s to %s", GST_ELEMENT_NAME(src), GST_ELEMENT_NAME(dest)), (nullptr));
+        return FALSE;
+    }
     return TRUE;
 }
 
@@ -399,6 +455,40 @@ static void gva_watermark_unlink_vavaapi_path(GstGvaWatermark *self) {
     self->postproc = nullptr;
 }
 
+// Transparent path:
+// |ghost sink| -> <watermarkimpl> -> |ghost src|
+// Skips identity; gvawatermarkimpl handles everything directly.
+static gboolean gva_watermark_link_transparent_path(GstGvaWatermark *self) {
+    if (!gst_bin_sync_children_states(GST_BIN(self))) {
+        GST_ELEMENT_ERROR(self, RESOURCE, NOT_FOUND, ("Couldn't sync elements state with parent bin"), (nullptr));
+        return FALSE;
+    }
+
+    // Connect sink ghost pad directly to watermarkimpl sink
+    GstPad *wmimpl_sink = gst_element_get_static_pad(self->watermarkimpl, "sink");
+    if (!gst_ghost_pad_set_target(GST_GHOST_PAD_CAST(self->sinkpad), wmimpl_sink)) {
+        GST_ERROR_OBJECT(self, "Couldn't set target for sink ghost pad");
+        gst_object_unref(wmimpl_sink);
+        return FALSE;
+    }
+    gst_object_unref(wmimpl_sink);
+
+    // Connect src ghost pad directly to watermarkimpl src
+    if (!gva_watermark_set_src_pad(self, self->watermarkimpl)) {
+        GST_ERROR_OBJECT(self, "Couldn't set target for src ghost pad");
+        return FALSE;
+    }
+
+    self->active_path = WatermarkPathTransparent;
+    GST_INFO_OBJECT(self, "Transparent path linked (identity bypassed)");
+    return TRUE;
+}
+
+static void gva_watermark_unlink_transparent_path(GstGvaWatermark *self) {
+    gst_ghost_pad_set_target(GST_GHOST_PAD_CAST(self->sinkpad), NULL);
+    gst_ghost_pad_set_target(GST_GHOST_PAD_CAST(self->srcpad), NULL);
+}
+
 // Direct path:
 // |ghost sink| -> <identity> -> <watermarkimpl> -> |ghost src|
 static gboolean gva_watermark_link_direct_path(GstGvaWatermark *self, bool use_postproc = false,
@@ -409,13 +499,24 @@ static gboolean gva_watermark_link_direct_path(GstGvaWatermark *self, bool use_p
             if (!self->postproc) {
                 GST_ERROR_OBJECT(self, "Could not create vaapipostproc instance");
             }
-        } else if (self->have_va) {
+        } else if (self->have_va && in_mem_type == VA_MEMORY_CAPS_FEATURE) {
             self->postproc = gst_element_factory_make("vapostproc", nullptr);
             if (!self->postproc) {
                 GST_ERROR_OBJECT(self, "Could not create vapostproc instance");
             }
+        } else if ((self->have_vaapi || self->have_va) && in_mem_type == SYSTEM_MEMORY_CAPS_FEATURE) {
+            // DMA case handled as VA(API)
+            // Check gva_watermark_start() for identitySrcFeature == DMA_BUF_CAPS_FEATURE.
+            self->postproc = self->have_va ? gst_element_factory_make("vapostproc", nullptr)
+                                           : gst_element_factory_make("vaapipostproc", nullptr);
+            if (!self->postproc) {
+                GST_ERROR_OBJECT(self, "Could not create vapostproc instance");
+            }
+        } else {
+            GST_ELEMENT_ERROR(self, CORE, MISSING_PLUGIN,
+                              ("GStreamer installation is missing plugins of VA-API or VA path"), (nullptr));
+            return FALSE;
         }
-
         gst_bin_add(GST_BIN(self), self->postproc);
     }
 
@@ -459,11 +560,9 @@ static gboolean gva_watermark_switch_path(GstGvaWatermark *self, enum WatermarkP
     g_assert(path != WatermarkPathNone && "Cannot switch path to None");
     GST_DEBUG_OBJECT(self, "Switching to path: %d, memory type: %d", path, in_mem_type);
 
-    // Check if we already using the requested path
     if (self->active_path == path)
         return TRUE;
 
-    // Block incoming data
     gva_watermark_block_sink(self, TRUE);
 
     switch (self->active_path) {
@@ -473,68 +572,75 @@ static gboolean gva_watermark_switch_path(GstGvaWatermark *self, enum WatermarkP
     case WatermarkPathVaVaapi:
         gva_watermark_unlink_vavaapi_path(self);
         break;
+    case WatermarkPathTransparent:
+        gva_watermark_unlink_transparent_path(self);
+        break;
     case WatermarkPathNone:
         break;
     default:
         GST_ERROR_OBJECT(self, "Unexpected path received during the gvawatermark unlink");
+        gva_watermark_block_sink(self, FALSE);
         return FALSE;
     }
 
     gboolean result = FALSE;
     switch (path) {
     case WatermarkPathDirect:
-        /* FIXME: using system caps with NV12 and VA-API elements after watermark, e.g. encoder,
-         * lead to unexpected behavior. Remove when issue is resolved */
         result = gva_watermark_link_direct_path(self, self->is_active_nv12 && (self->have_vaapi || self->have_va),
                                                 in_mem_type);
         break;
     case WatermarkPathVaVaapi:
         result = gva_watermark_link_vavaapi_path(self, in_mem_type);
         break;
+    case WatermarkPathTransparent:
+        result = gva_watermark_link_transparent_path(self);
+        break;
     case WatermarkPathNone:
     default:
         GST_ERROR_OBJECT(self, "Unexpected path received during the gvawatermark link");
+        gva_watermark_block_sink(self, FALSE);
         return FALSE;
     }
 
-    // Remove block
     gva_watermark_block_sink(self, FALSE);
-
     return result;
 }
 
 static gboolean gst_gva_watermark_sink_event(GstPad *pad, GstObject *parent, GstEvent *event) {
     GstGvaWatermark *self = GST_GVA_WATERMARK(parent);
 
-    switch (GST_EVENT_TYPE(event)) {
-    case GST_EVENT_CAPS: {
-        GstCaps *incaps;
-        gst_event_parse_caps(event, &incaps);
-        GST_DEBUG_OBJECT(parent, "Got CAPS event, caps: %" GST_PTR_FORMAT, incaps);
+    if (!(self->use_watermarkimpl_only)) {
 
-        auto target_memtype = get_caps_feature(incaps);
+        switch (GST_EVENT_TYPE(event)) {
+        case GST_EVENT_CAPS: {
+            GstCaps *incaps;
+            gst_event_parse_caps(event, &incaps);
+            GST_DEBUG_OBJECT(parent, "Got CAPS event, caps: %" GST_PTR_FORMAT, incaps);
 
-        // Non-system memory (WatermarkPathVaVaapi path) accepts BGRx images only
-        if ((target_memtype != SYSTEM_MEMORY_CAPS_FEATURE) && !is_caps_format_equal(incaps, "BGRx"))
-            if (!unlink_videoconvert(self))
-                return FALSE;
+            auto target_memtype = get_caps_feature(incaps);
 
-        self->is_active_nv12 = is_caps_format_equal(incaps, "NV12");
+            // Non-system memory (WatermarkPathVaVaapi path) accepts BGRx images only
+            if ((target_memtype != SYSTEM_MEMORY_CAPS_FEATURE) && !is_caps_format_equal(incaps, "BGRx"))
+                if (!unlink_videoconvert(self))
+                    return FALSE;
 
-        /* save preferred path here to change on GST_EVENT_SEGMENT if needed */
-        if (target_memtype == SYSTEM_MEMORY_CAPS_FEATURE)
-            self->preferred_path = WatermarkPathDirect;
-        else
-            self->preferred_path = WatermarkPathVaVaapi;
+            self->is_active_nv12 = is_caps_format_equal(incaps, "NV12");
 
-    } break;
-    case GST_EVENT_SEGMENT: {
-        if (self->preferred_path == WatermarkPathDirect)
-            if (!gva_watermark_switch_path(self, WatermarkPathDirect, SYSTEM_MEMORY_CAPS_FEATURE))
-                return FALSE;
-    } break;
-    default:
-        break;
+            // save preferred path here to change on GST_EVENT_SEGMENT if needed
+            if (target_memtype == SYSTEM_MEMORY_CAPS_FEATURE)
+                self->preferred_path = WatermarkPathDirect;
+            else
+                self->preferred_path = WatermarkPathVaVaapi;
+
+        } break;
+        case GST_EVENT_SEGMENT: {
+            if (self->preferred_path == WatermarkPathDirect)
+                if (!gva_watermark_switch_path(self, WatermarkPathDirect, SYSTEM_MEMORY_CAPS_FEATURE))
+                    return FALSE;
+        } break;
+        default:
+            break;
+        }
     }
 
     return gst_pad_event_default(pad, parent, event);
@@ -560,10 +666,18 @@ static gboolean gva_watermark_start(GstGvaWatermark *self) {
     if (identitySrcFeature == VA_SURFACE_CAPS_FEATURE && self->have_vaapi) {
         self->have_va = false;
         in_memory_type = VA_SURFACE_CAPS_FEATURE;
-    } else if (self->have_va) { // Prefer GST-VA
+    } else if ((identitySrcFeature == VA_MEMORY_CAPS_FEATURE || identitySrcFeature == DMA_BUF_CAPS_FEATURE) &&
+               self->have_va) {
         self->have_vaapi = false;
+        // Prefered GST-VA path, see DEVICE_GPU_AUTOSELECTED
         in_memory_type = VA_MEMORY_CAPS_FEATURE;
+    } else {
+        self->have_va = false;
+        self->have_vaapi = false;
     }
+
+    if (self->use_watermarkimpl_only)
+        return gva_watermark_switch_path(self, WatermarkPathTransparent, in_memory_type);
 
     if (self->have_vaapi || self->have_va) {
         if (gva_watermark_switch_path(self, WatermarkPathVaVaapi, in_memory_type) && link_videoconvert(self))

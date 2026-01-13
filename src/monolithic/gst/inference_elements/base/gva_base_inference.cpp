@@ -1,5 +1,5 @@
 /*******************************************************************************
- * Copyright (C) 2018-2024 Intel Corporation
+ * Copyright (C) 2018-2025 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  ******************************************************************************/
@@ -17,9 +17,11 @@
 #include "inference_impl.h"
 
 #include "gva_base_inference_priv.hpp"
+#include <memory>
 
 #define DEFAULT_MODEL nullptr
 #define DEFAULT_MODEL_INSTANCE_ID nullptr
+#define DEFAULT_SCHEDULING_POLICY "throughput"
 #define DEFAULT_MODEL_PROC nullptr
 #define DEFAULT_DEVICE "CPU"
 #define DEFAULT_PRE_PROC "" // empty = autoselection
@@ -66,10 +68,20 @@
 
 #define DEFAULT_ALLOCATOR_NAME nullptr
 
+#define DEFAULT_CUSTOM_PREPROC_LIB nullptr
+
+#define DEFAULT_CUSTOM_POSTPROC_LIB nullptr
+
+#define DEFAULT_OV_EXTENSION_LIB nullptr
+
+#define DEFAULT_SHARE_VADISPLAY_CTX TRUE
+
 G_DEFINE_TYPE_WITH_PRIVATE(GvaBaseInference, gva_base_inference, GST_TYPE_BASE_TRANSFORM);
 
 GST_DEBUG_CATEGORY_STATIC(gva_base_inference_debug_category);
 #define GST_CAT_DEFAULT gva_base_inference_debug_category
+
+extern std::shared_ptr<InferenceImpl> acquire_inference_instance(GvaBaseInference *base_inference);
 
 enum {
     PROP_0,
@@ -83,6 +95,7 @@ enum {
     PROP_NO_BLOCK,
     PROP_NIREQ,
     PROP_MODEL_INSTANCE_ID,
+    PROP_SCHEDULING_POLICY,
     PROP_PRE_PROC_BACKEND,
     PROP_MODEL_PROC,
     PROP_CPU_THROUGHPUT_STREAMS,
@@ -93,7 +106,11 @@ enum {
     PROP_OBJECT_CLASS,
     PROP_LABELS,
     PROP_LABELS_FILE,
-    PROP_SCALE_METHOD
+    PROP_SCALE_METHOD,
+    PROP_CUSTOM_PREPROC_LIB,
+    PROP_CUSTOM_POSTPROC_LIB,
+    PROP_OV_EXTENSION_LIB,
+    PROP_SHARE_VADISPLAY_CTX
 };
 
 GType gst_gva_base_inference_get_inf_region(void) {
@@ -133,8 +150,8 @@ static void gva_base_inference_class_init(GvaBaseInferenceClass *klass);
 
 static bool is_roi_inference_needed(GvaBaseInference *gva_base_inference, guint64 current_num_frame, GstBuffer *buffer,
                                     GstVideoRegionOfInterestMeta *roi) {
-    InferenceImpl *inference = gva_base_inference->inference;
-    g_assert(inference);
+    auto inference = gva_base_inference->inference;
+    g_assert(inference != nullptr);
 
     if (!InferenceImpl::IsRoiSizeValid(roi))
         return false;
@@ -145,6 +162,34 @@ static bool is_roi_inference_needed(GvaBaseInference *gva_base_inference, guint6
     if (gva_base_inference->specific_roi_filter)
         return gva_base_inference->specific_roi_filter(gva_base_inference, current_num_frame, buffer, roi);
     return true;
+}
+
+static GstCaps *gva_base_inference_transform_caps(GstBaseTransform *trans, GstPadDirection direction, GstCaps *caps,
+                                                  GstCaps *filter) {
+    GvaBaseInference *base_inference = GVA_BASE_INFERENCE(trans);
+
+    // Get the default transformed caps from the parent class
+    GstCaps *result =
+        GST_BASE_TRANSFORM_CLASS(gva_base_inference_parent_class)->transform_caps(trans, direction, caps, filter);
+
+    // If device is CPU, filter out memory:VASurface, memory:VAMemory, memory:DMABuf
+    if (base_inference->device && g_strcmp0(base_inference->device, "CPU") == 0) {
+        GstCaps *filtered = gst_caps_copy(result);
+        for (gint i = gst_caps_get_size(filtered) - 1; i >= 0; --i) {
+            GstCapsFeatures *features = gst_caps_get_features(filtered, i);
+            if ((gst_caps_features_contains(features, "memory:VASurface")) ||
+                (gst_caps_features_contains(features, "memory:VAMemory")) ||
+                (gst_caps_features_contains(features, "memory:DMABuf")) ||
+                (gst_caps_features_contains(features, "memory:D3D11Memory"))) {
+                gst_caps_remove_structure(filtered, i);
+                GST_WARNING("Filtered out structure %d from caps, it contains unsupported memory type", i);
+            }
+        }
+        gst_caps_unref(result);
+        result = filtered;
+    }
+
+    return result;
 }
 
 void gva_base_inference_class_init(GvaBaseInferenceClass *klass) {
@@ -159,6 +204,7 @@ void gva_base_inference_class_init(GvaBaseInferenceClass *klass) {
     gobject_class->get_property = gva_base_inference_get_property;
     gobject_class->dispose = gva_base_inference_dispose;
     gobject_class->finalize = gva_base_inference_finalize;
+    base_transform_class->transform_caps = GST_DEBUG_FUNCPTR(gva_base_inference_transform_caps);
     base_transform_class->set_caps = GST_DEBUG_FUNCPTR(gva_base_inference_set_caps);
     base_transform_class->start = GST_DEBUG_FUNCPTR(gva_base_inference_start);
     base_transform_class->stop = GST_DEBUG_FUNCPTR(gva_base_inference_stop);
@@ -176,12 +222,41 @@ void gva_base_inference_class_init(GvaBaseInferenceClass *klass) {
         g_param_spec_string("model", "Model", "Path to inference model network file", DEFAULT_MODEL, param_flags));
 
     g_object_class_install_property(
+        gobject_class, PROP_CUSTOM_PREPROC_LIB,
+        g_param_spec_string("custom-preproc-lib", "Custom Pre-processing Library",
+                            "Path to the .so file defining custom input image pre-processing",
+                            DEFAULT_CUSTOM_PREPROC_LIB, param_flags));
+
+    g_object_class_install_property(
+        gobject_class, PROP_CUSTOM_POSTPROC_LIB,
+        g_param_spec_string("custom-postproc-lib", "Custom Post-processing Library",
+                            "Path to the .so file defining custom model output converter. "
+                            "The library must implement the Convert function: "
+                            "void Convert(GstTensorMeta *outputTensors, const GstStructure *network, "
+                            "const GstStructure *params, GstAnalyticsRelationMeta *relationMeta);",
+                            DEFAULT_CUSTOM_POSTPROC_LIB, param_flags));
+
+    g_object_class_install_property(gobject_class, PROP_OV_EXTENSION_LIB,
+                                    g_param_spec_string("ov-extension-lib", "OpenVINO Extension Library",
+                                                        "Path to the .so file defining custom OpenVINO operations.",
+                                                        DEFAULT_OV_EXTENSION_LIB, param_flags));
+
+    g_object_class_install_property(
         gobject_class, PROP_MODEL_INSTANCE_ID,
         g_param_spec_string(
             "model-instance-id", "Model Instance Id",
             "Identifier for sharing a loaded model instance between elements of the same type. Elements with the "
             "same model-instance-id will share all model and inference engine related properties",
             DEFAULT_MODEL_INSTANCE_ID, param_flags));
+
+    g_object_class_install_property(
+        gobject_class, PROP_SCHEDULING_POLICY,
+        g_param_spec_string("scheduling-policy", "Scheduling Policy",
+                            "Scheduling policy across streams sharing same model instance: "
+                            "throughput (select first incoming frame), "
+                            "latency (select frames with earliest presentation time out of the streams sharing same "
+                            "model-instance-id; recommended batch-size less than or equal to the number of streams) ",
+                            DEFAULT_SCHEDULING_POLICY, (GParamFlags)(param_flags)));
 
     g_object_class_install_property(
         gobject_class, PROP_PRE_PROC_BACKEND,
@@ -311,6 +386,13 @@ void gva_base_inference_class_init(GvaBaseInferenceClass *klass) {
                                                         " Only default and scale-method=fast (VAAPI based) supported "
                                                         "in this element",
                                                         nullptr, param_flags));
+
+    g_object_class_install_property(
+        gobject_class, PROP_SHARE_VADISPLAY_CTX,
+        g_param_spec_boolean("share-va-display-ctx", "Share VA Display Context",
+                             "Whether to share VA Display context across inference elements: "
+                             "true (share context, default), false (do not share context)",
+                             DEFAULT_SHARE_VADISPLAY_CTX, param_flags));
 }
 
 void gva_base_inference_cleanup(GvaBaseInference *base_inference) {
@@ -341,6 +423,9 @@ void gva_base_inference_cleanup(GvaBaseInference *base_inference) {
     g_free(base_inference->model_instance_id);
     base_inference->model_instance_id = nullptr;
 
+    g_free(base_inference->scheduling_policy);
+    base_inference->scheduling_policy = nullptr;
+
     g_free(base_inference->pre_proc_type);
     base_inference->pre_proc_type = nullptr;
 
@@ -363,25 +448,26 @@ void gva_base_inference_cleanup(GvaBaseInference *base_inference) {
     base_inference->num_skipped_frames = UINT_MAX - 1; // always run inference on first frame
     base_inference->frame_num = DEFAULT_FIRST_FRAME_NUM;
 
-    if (base_inference->object_class) {
-        g_free(base_inference->object_class);
-        base_inference->object_class = nullptr;
-    }
+    g_free(base_inference->object_class);
+    base_inference->object_class = nullptr;
 
-    if (base_inference->labels) {
-        g_free(base_inference->labels);
-        base_inference->labels = nullptr;
-    }
+    g_free(base_inference->labels);
+    base_inference->labels = nullptr;
 
-    if (base_inference->post_proc) {
-        releasePostProcessor(base_inference->post_proc);
-        base_inference->post_proc = nullptr;
-    }
+    releasePostProcessor(base_inference->post_proc);
+    base_inference->post_proc = nullptr;
 
-    if (base_inference->scale_method) {
-        g_free(base_inference->scale_method);
-        base_inference->scale_method = nullptr;
-    }
+    g_free(base_inference->scale_method);
+    base_inference->scale_method = nullptr;
+
+    g_free(base_inference->custom_preproc_lib);
+    base_inference->custom_preproc_lib = nullptr;
+
+    g_free(base_inference->custom_postproc_lib);
+    base_inference->custom_postproc_lib = nullptr;
+
+    g_free(base_inference->ov_extension_lib);
+    base_inference->ov_extension_lib = nullptr;
 }
 
 void gva_base_inference_init(GvaBaseInference *base_inference) {
@@ -394,6 +480,7 @@ void gva_base_inference_init(GvaBaseInference *base_inference) {
 
     // Intialization of private data
     auto *priv_memory = gva_base_inference_get_instance_private(base_inference);
+    // This won't be converted to shared ptr because of memory placement
     base_inference->priv = new (priv_memory) GvaBaseInferencePrivate();
 
     base_inference->model = g_strdup(DEFAULT_MODEL);
@@ -407,6 +494,7 @@ void gva_base_inference_init(GvaBaseInference *base_inference) {
     base_inference->no_block = DEFAULT_NO_BLOCK;
     base_inference->nireq = DEFAULT_NIREQ;
     base_inference->model_instance_id = g_strdup(DEFAULT_MODEL_INSTANCE_ID);
+    base_inference->scheduling_policy = g_strdup(DEFAULT_SCHEDULING_POLICY);
     base_inference->pre_proc_type = g_strdup(DEFAULT_PRE_PROC);
     // TODO: make one property for streams
     base_inference->cpu_streams = DEFAULT_CPU_THROUGHPUT_STREAMS;
@@ -431,6 +519,11 @@ void gva_base_inference_init(GvaBaseInference *base_inference) {
     base_inference->object_class = DEFAULT_OBJECT_CLASS;
     base_inference->labels = DEFAULT_LABELS;
     base_inference->scale_method = nullptr;
+    base_inference->custom_preproc_lib = g_strdup(DEFAULT_MODEL_PROC);
+    base_inference->custom_postproc_lib = g_strdup(DEFAULT_CUSTOM_POSTPROC_LIB);
+    base_inference->ov_extension_lib = g_strdup(DEFAULT_OV_EXTENSION_LIB);
+
+    base_inference->share_va_display_ctx = DEFAULT_SHARE_VADISPLAY_CTX;
 }
 
 GstStateChangeReturn gva_base_inference_change_state(GstElement *element, GstStateChange transition) {
@@ -542,6 +635,10 @@ void gva_base_inference_set_property(GObject *object, guint property_id, const G
         g_free(base_inference->model_instance_id);
         base_inference->model_instance_id = g_value_dup_string(value);
         break;
+    case PROP_SCHEDULING_POLICY:
+        g_free(base_inference->scheduling_policy);
+        base_inference->scheduling_policy = g_value_dup_string(value);
+        break;
     case PROP_PRE_PROC_BACKEND:
         g_free(base_inference->pre_proc_type);
         base_inference->pre_proc_type = g_value_dup_string(value);
@@ -604,6 +701,24 @@ void gva_base_inference_set_property(GObject *object, guint property_id, const G
             base_inference->pre_proc_config = g_strdup("VAAPI_FAST_SCALE_LOAD_FACTOR=1");
         } else
             GST_ERROR_OBJECT(base_inference, "Unsupported scale-method=%s", g_value_get_string(value));
+        break;
+    case PROP_CUSTOM_PREPROC_LIB:
+        g_free(base_inference->custom_preproc_lib);
+        base_inference->custom_preproc_lib = g_value_dup_string(value);
+        GST_INFO_OBJECT(base_inference, "custom-preproc-lib: %s", base_inference->custom_preproc_lib);
+        break;
+    case PROP_CUSTOM_POSTPROC_LIB:
+        g_free(base_inference->custom_postproc_lib);
+        base_inference->custom_postproc_lib = g_value_dup_string(value);
+        GST_INFO_OBJECT(base_inference, "custom-postproc-lib: %s", base_inference->custom_postproc_lib);
+        break;
+    case PROP_OV_EXTENSION_LIB:
+        g_free(base_inference->ov_extension_lib);
+        base_inference->ov_extension_lib = g_value_dup_string(value);
+        GST_INFO_OBJECT(base_inference, "ov-extension-lib: %s", base_inference->ov_extension_lib);
+        break;
+    case PROP_SHARE_VADISPLAY_CTX:
+        base_inference->share_va_display_ctx = g_value_get_boolean(value);
         break;
     default:
         G_OBJECT_WARN_INVALID_PROPERTY_ID(object, property_id, pspec);
@@ -680,6 +795,21 @@ void gva_base_inference_get_property(GObject *object, guint property_id, GValue 
     case PROP_SCALE_METHOD:
         g_value_set_string(value, base_inference->scale_method);
         break;
+    case PROP_CUSTOM_PREPROC_LIB:
+        g_value_set_string(value, base_inference->custom_preproc_lib);
+        break;
+    case PROP_CUSTOM_POSTPROC_LIB:
+        g_value_set_string(value, base_inference->custom_postproc_lib);
+        break;
+    case PROP_OV_EXTENSION_LIB:
+        g_value_set_string(value, base_inference->ov_extension_lib);
+        break;
+    case PROP_SHARE_VADISPLAY_CTX:
+        g_value_set_boolean(value, base_inference->share_va_display_ctx);
+        break;
+    case PROP_SCHEDULING_POLICY:
+        g_value_set_string(value, base_inference->scheduling_policy);
+        break;
     default:
         G_OBJECT_WARN_INVALID_PROPERTY_ID(object, property_id, pspec);
         break;
@@ -729,6 +859,37 @@ gboolean gva_base_inference_set_caps(GstBaseTransform *trans, GstCaps *incaps, G
             return FALSE;
     }
 
+    // Check if the caps are compatible with the device
+    if ((base_inference->device && g_strcmp0(base_inference->device, "CPU") == 0 &&
+         ((gst_caps_features_contains(gst_caps_get_features(incaps, 0), "memory:VASurface")) ||
+          (gst_caps_features_contains(gst_caps_get_features(incaps, 0), "memory:VAMemory")) ||
+          (gst_caps_features_contains(gst_caps_get_features(incaps, 0), "memory:DMABuf")) ||
+          (gst_caps_features_contains(gst_caps_get_features(incaps, 0), "memory:D3D11Memory"))))) {
+        GST_ELEMENT_WARNING(base_inference, RESOURCE, SETTINGS,
+                            ("Refusing caps other than SYSTEM_MEMORY_CAPS because device is set to CPU"),
+                            ("Set device property to a hardware accelerator (e.g., GPU) to enable VA memory types."));
+        return FALSE;
+    }
+
+    auto element_name = GST_ELEMENT_NAME(GST_ELEMENT(base_inference));
+    // convert element_name to std::string and remove trailing numbers from element name
+    std::string element_name_str = std::string(element_name);
+    auto pos = element_name_str.find_last_of("0123456789");
+    if (pos != std::string::npos)
+        element_name_str = element_name_str.substr(0, pos);
+
+    if (base_inference->device && g_strcmp0(base_inference->device, "CPU") != 0 &&
+        (gst_caps_features_contains(gst_caps_get_features(incaps, 0), "memory:SystemMemory"))) {
+        GST_ELEMENT_WARNING(
+            base_inference, RESOURCE, SETTINGS,
+            ("\n\nSystem memory is being used for inference on device '%s'. For optimal performance, use "
+             "VA memory in the pipeline:\n\nvapostproc ! \"video/x-raw(memory:VAMemory)\" ! %s device=%s model=%s.\n",
+             base_inference->device, element_name_str.c_str(), base_inference->device, base_inference->model),
+            ("System memory transfers are less efficient than VA memory for device '%s'. Consider "
+             "using memory:VAMemory for better performance. \n",
+             base_inference->device));
+    }
+
     if (base_inference->inference && base_inference->info &&
         gst_video_info_is_equal(base_inference->info, &video_info) && base_inference->caps_feature == caps_feature) {
         // We alredy have an inference model instance.
@@ -750,13 +911,6 @@ gboolean gva_base_inference_set_caps(GstBaseTransform *trans, GstCaps *incaps, G
 
     base_inference->priv->buffer_mapper.reset();
 
-    // If pre-process-backend property not set and SYSTEM_MEMORY_CAPS, set preproc to "ie".
-    // Added due to VAAPI media driver stability issues, this emulates behaviour of 2021.x releases
-    if (!base_inference->pre_proc_type || !*base_inference->pre_proc_type) {
-        if (caps_feature == SYSTEM_MEMORY_CAPS_FEATURE)
-            base_inference->pre_proc_type = g_strdup("ie");
-    }
-
     // Need to acquire inference model instance
     try {
         if (!base_inference->priv->va_display && (base_inference->caps_feature == VA_SURFACE_CAPS_FEATURE ||
@@ -774,8 +928,20 @@ gboolean gva_base_inference_set_caps(GstBaseTransform *trans, GstCaps *incaps, G
                                           "gstreamer-vaapi isn't built with required patches");
             }
         }
+#ifdef _MSC_VER
+        if (!base_inference->priv->d3d11_device && (base_inference->caps_feature == D3D11_MEMORY_CAPS_FEATURE)) {
+            // Try to query D3D11Device from decoder. Select dlstreamer::MemoryType::D3D11 memory type as default.
+            try {
+                base_inference->priv->d3d11_device =
+                    std::make_shared<dlstreamer::GSTContextQuery>(trans, dlstreamer::MemoryType::D3D11);
+                GST_INFO_OBJECT(trans, "Got D3D11Device (%p) from query", base_inference->priv->d3d11_device.get());
+            } catch (...) {
+                GST_WARNING_OBJECT(trans, "Couldn't query D3D11Device from gstreamer-d3d11 elements.");
+            }
+        }
+#endif
 
-        base_inference->inference = acquire_inference_instance(base_inference);
+        base_inference->inference = acquire_inference_instance(base_inference).get();
         if (!base_inference->inference)
             throw std::runtime_error("inference is NULL.");
 
@@ -788,9 +954,21 @@ gboolean gva_base_inference_set_caps(GstBaseTransform *trans, GstCaps *incaps, G
         }
 
         // Create a buffer mapper once we know the target memory type
+#ifdef _MSC_VER
+        if (base_inference->caps_feature == D3D11_MEMORY_CAPS_FEATURE) {
+            base_inference->priv->buffer_mapper =
+                BufferMapperFactory::createMapper(base_inference->inference->GetInferenceMemoryType(),
+                                                  base_inference->info, base_inference->priv->d3d11_device);
+        } else {
+            base_inference->priv->buffer_mapper =
+                BufferMapperFactory::createMapper(base_inference->inference->GetInferenceMemoryType(),
+                                                  base_inference->info, base_inference->priv->va_display);
+        }
+#else
         base_inference->priv->buffer_mapper =
             BufferMapperFactory::createMapper(base_inference->inference->GetInferenceMemoryType(), base_inference->info,
                                               base_inference->priv->va_display);
+#endif
 
         if (!base_inference->priv->buffer_mapper)
             throw std::runtime_error("couldn't create buffer mapper");

@@ -1,35 +1,56 @@
 /*******************************************************************************
- * Copyright (C) 2018-2024 Intel Corporation
+ * Copyright (C) 2018-2025 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  ******************************************************************************/
-
 #include "opencv_pre_proc.h"
-
 #include "inference_backend/logger.h"
 #include "opencv_utils.h"
 #include "safe_arithmetic.hpp"
 #include "utils.h"
 
+#include <dlfcn.h> // For dynamic loading on Unix-like systems
+#include <iostream>
 #include <opencv2/opencv.hpp>
 
 namespace GlobUtils = Utils;
 using namespace InferenceBackend;
 using namespace InferenceBackend::Utils;
 
-ImagePreprocessor *InferenceBackend::CreatePreProcOpenCV() {
-    return new OpenCV_VPP();
+ImagePreprocessor *InferenceBackend::CreatePreProcOpenCV(const std::string custom_preproc_lib) {
+    return new OpenCV_VPP(custom_preproc_lib);
 }
 
-OpenCV_VPP::OpenCV_VPP() {
+OpenCV_VPP::OpenCV_VPP(const std::string &user_library_path) {
+    // Load the user-defined library and set the callback if a path is provided
+    if (!user_library_path.empty()) {
+        ImageProcessingCallback user_callback = loadUserLibrary(user_library_path);
+        if (user_callback) {
+            setUserCallback(user_callback);
+        }
+    }
 }
 
 OpenCV_VPP::~OpenCV_VPP() {
+    if (library_handle) {
+        dlclose(library_handle);
+    }
 }
 
-namespace {
+void OpenCV_VPP::setUserCallback(const ImageProcessingCallback &callback) {
+    user_callback = callback;
+}
 
-void CopyImage(const Image &src, Image &dst) {
+cv::Rect OpenCV_VPP::centralCropROI(const cv::Mat &image) {
+    int height = image.rows;
+    int width = image.cols;
+    int cropSize = std::min(height, width);
+    int startX = (width - cropSize) / 2;
+    int startY = (height - cropSize) / 2;
+    return cv::Rect(startX, startY, cropSize, cropSize);
+}
+
+void OpenCV_VPP::CopyImage(const Image &src, Image &dst) {
     uint32_t planes_count = ::Utils::GetPlanesCount(src.format);
     for (uint32_t i = 0; i < planes_count; i++) {
         uint32_t dst_stride = src.width;
@@ -41,12 +62,18 @@ void CopyImage(const Image &src, Image &dst) {
     }
 }
 
-} // namespace
-
-cv::Mat CustomImageConvert(const cv::Mat &orig_image, const int src_color_format, const cv::Size &input_size,
-                           const InputImageLayerDesc::Ptr &pre_proc_info,
-                           const ImageTransformationParams::Ptr &image_transform_info) {
+cv::Mat OpenCV_VPP::CustomImageConvert(const cv::Mat &orig_image, const int src_color_format,
+                                       const cv::Size &input_size, const InputImageLayerDesc::Ptr &pre_proc_info,
+                                       const ImageTransformationParams::Ptr &image_transform_info) {
     try {
+        cv::Mat processed_image = orig_image;
+
+        // Invoke user-defined callback if it exists
+        if (user_callback) {
+            processed_image = user_callback(orig_image);
+            // cv::imwrite("output_image.jpg", processed_image); // testing
+        }
+
         if (!pre_proc_info)
             throw std::runtime_error("Pre-processor info for custom image pre-processing is null.");
 
@@ -61,34 +88,39 @@ cv::Mat CustomImageConvert(const cv::Mat &orig_image, const int src_color_format
             fill_value = padding.fill_value;
         }
 
+        if (padding_x > std::numeric_limits<int>::max() / 2 || padding_y > std::numeric_limits<int>::max() / 2 ||
+            input_size.width < 0 || input_size.height < 0) {
+            throw std::range_error("Invalid padding or range");
+        }
+
         cv::Size input_size_except_padding(input_size.width - (padding_x * 2), input_size.height - (padding_y * 2));
 
         // Resize
-        cv::Mat image_to_insert = orig_image;
-        if (pre_proc_info->doNeedResize() && orig_image.size() != input_size_except_padding) {
+        cv::Mat image_to_insert = processed_image;
+        if (pre_proc_info->doNeedResize() && processed_image.size() != input_size_except_padding) {
             double additional_crop_scale_param = 1;
             if (pre_proc_info->doNeedCrop() && pre_proc_info->doNeedResize()) {
                 additional_crop_scale_param = 1.125;
             }
 
-            double resize_scale_param_x = 1;
-            double resize_scale_param_y = 1;
+            double resize_scale_param_x =
+                safe_convert<double>(input_size_except_padding.width) / processed_image.size().width;
+            double resize_scale_param_y =
+                safe_convert<double>(input_size_except_padding.height) / processed_image.size().height;
 
-            resize_scale_param_x = safe_convert<double>(input_size_except_padding.width) / orig_image.size().width;
-            resize_scale_param_y = safe_convert<double>(input_size_except_padding.height) / orig_image.size().height;
-
-            if (pre_proc_info->getResizeType() == InputImageLayerDesc::Resize::ASPECT_RATIO) {
+            if ((pre_proc_info->getResizeType() == InputImageLayerDesc::Resize::ASPECT_RATIO) ||
+                (pre_proc_info->getResizeType() == InputImageLayerDesc::Resize::ASPECT_RATIO_PAD)) {
                 resize_scale_param_x = resize_scale_param_y = std::min(resize_scale_param_x, resize_scale_param_y);
             }
 
             resize_scale_param_x *= additional_crop_scale_param;
             resize_scale_param_y *= additional_crop_scale_param;
 
-            cv::Size after_resize(orig_image.size().width * resize_scale_param_x,
-                                  orig_image.size().height * resize_scale_param_y);
+            cv::Size after_resize(processed_image.size().width * resize_scale_param_x,
+                                  processed_image.size().height * resize_scale_param_y);
 
             ITT_TASK("cv::resize");
-            cv::resize(orig_image, image_to_insert, after_resize);
+            cv::resize(processed_image, image_to_insert, after_resize);
 
             if (image_transform_info)
                 image_transform_info->ResizeHasDone(resize_scale_param_x, resize_scale_param_y);
@@ -110,47 +142,42 @@ cv::Mat CustomImageConvert(const cv::Mat &orig_image, const int src_color_format
             cv::Size crop_rect_size(image_to_insert.size().width - safe_convert<int>(cropped_border_x),
                                     image_to_insert.size().height - safe_convert<int>(cropped_border_y));
             cv::Point2f top_left_rect_point;
-            switch (pre_proc_info->getCropType()) {
-            case InputImageLayerDesc::Crop::CENTRAL:
-                top_left_rect_point = cv::Point2f(cropped_border_x / 2, cropped_border_y / 2);
-                break;
-            case InputImageLayerDesc::Crop::TOP_LEFT:
-                top_left_rect_point = cv::Point2f(0, 0);
-                break;
-            case InputImageLayerDesc::Crop::TOP_RIGHT:
-                top_left_rect_point = cv::Point2f(cropped_border_x, 0);
-                break;
-            case InputImageLayerDesc::Crop::BOTTOM_LEFT:
-                top_left_rect_point = cv::Point2f(0, cropped_border_y);
-                break;
-            case InputImageLayerDesc::Crop::BOTTOM_RIGHT:
-                top_left_rect_point = cv::Point2f(cropped_border_x, cropped_border_y);
-                break;
-            default:
-                throw std::runtime_error("Unknown crop format.");
-            }
 
-            cv::Rect crop_rect(top_left_rect_point, crop_rect_size);
-            Crop(image_to_insert, crop_rect, image_transform_info);
+            if (pre_proc_info->getCropType() == InputImageLayerDesc::Crop::CENTRAL_RESIZE) {
+                cv::Rect crop_rect = centralCropROI(processed_image);
+                image_to_insert = processed_image;
+                Crop(image_to_insert, crop_rect, image_transform_info);
+                cv::resize(image_to_insert, image_to_insert, crop_rect_size, cv::INTER_CUBIC);
+            } else {
+                switch (pre_proc_info->getCropType()) {
+                case InputImageLayerDesc::Crop::CENTRAL:
+                    top_left_rect_point = cv::Point2f(cropped_border_x / 2, cropped_border_y / 2);
+                    break;
+                case InputImageLayerDesc::Crop::TOP_LEFT:
+                    top_left_rect_point = cv::Point2f(0, 0);
+                    break;
+                case InputImageLayerDesc::Crop::TOP_RIGHT:
+                    top_left_rect_point = cv::Point2f(cropped_border_x, 0);
+                    break;
+                case InputImageLayerDesc::Crop::BOTTOM_LEFT:
+                    top_left_rect_point = cv::Point2f(0, cropped_border_y);
+                    break;
+                case InputImageLayerDesc::Crop::BOTTOM_RIGHT:
+                    top_left_rect_point = cv::Point2f(cropped_border_x, cropped_border_y);
+                    break;
+                default:
+                    throw std::runtime_error("Unknown crop format.");
+                }
+
+                cv::Rect crop_rect(top_left_rect_point, crop_rect_size);
+                Crop(image_to_insert, crop_rect, image_transform_info);
+            }
         }
 
         // Color Space Conversion
         if (pre_proc_info->doNeedColorSpaceConversion(src_color_format)) {
             ColorSpaceConvert(image_to_insert, image_to_insert, src_color_format, pre_proc_info->getTargetColorSpace());
         }
-
-        // Normalization is handled in OV backend, as all input images are assumed to be U8
-        // if (pre_proc_info->doNeedRangeNormalization()) {
-        //     const auto &range_norm = pre_proc_info->getRangeNormalization();
-        //     const double std = 255.0 / (range_norm.max - range_norm.min);
-        //     const double mean = 0 - range_norm.min;
-        //     Normalization(image_to_insert, mean, std);
-        // }
-        // Ditto
-        // if (pre_proc_info->doNeedDistribNormalization()) {
-        //     const auto &distrib_norm = pre_proc_info->getDistribNormalization();
-        //     Normalization(image_to_insert, distrib_norm.mean, distrib_norm.std);
-        // }
 
         // Set background color
         cv::Scalar background_color;
@@ -182,6 +209,12 @@ cv::Mat CustomImageConvert(const cv::Mat &orig_image, const int src_color_format
 
         int shift_x = (input_size.width - image_to_insert.size().width) / 2;
         int shift_y = (input_size.height - image_to_insert.size().height) / 2;
+
+        if (pre_proc_info->getResizeType() == InputImageLayerDesc::Resize::ASPECT_RATIO_PAD) {
+            shift_x = 0;
+            shift_y = 0;
+        }
+
         cv::Rect region_to_insert(shift_x, shift_y, image_to_insert.size().width, image_to_insert.size().height);
 
         cv::Mat result(input_size, image_to_insert.type(), background_color);
@@ -209,11 +242,8 @@ void OpenCV_VPP::Convert(const Image &raw_src, Image &dst, const InputImageLayer
         }
 
         Image src = ApplyCrop(raw_src);
-        // if identical format and resolution
         if (!needPreProcessing(raw_src, dst)) {
             CopyImage(raw_src, dst);
-            // do not return here. Code below is mandatory to execute landmarks inference on CentOS in case of vaapi
-            // pre-proc
         }
 
         cv::Mat src_mat_image;
@@ -240,8 +270,11 @@ void OpenCV_VPP::Convert(const Image &raw_src, Image &dst, const InputImageLayer
                 throw std::runtime_error(
                     "Formats with more than one plane could not be processed with `make_planar=false`");
             auto channels_count = GlobUtils::GetChannelsCount(dst.format);
-            cv::Mat dst_mat(safe_convert<int>(dst.height), safe_convert<int>(dst.width),
-                            CV_MAKE_TYPE(CV_8U, channels_count), dst.planes[0], dst.stride[0]);
+            if (channels_count > CV_DEPTH_MAX)
+                throw std::range_error("Number of channels exceeds OpenCV maximum (8)");
+            auto cv_type = CV_MAKE_TYPE(CV_8U, safe_convert<int>(channels_count));
+            cv::Mat dst_mat(safe_convert<int>(dst.height), safe_convert<int>(dst.width), cv_type, dst.planes[0],
+                            dst.stride[0]);
             dst_mat_image.copyTo(dst_mat);
         }
     } catch (const std::exception &e) {
@@ -250,4 +283,24 @@ void OpenCV_VPP::Convert(const Image &raw_src, Image &dst, const InputImageLayer
 }
 
 void OpenCV_VPP::ReleaseImage(const Image &) {
+}
+
+// Static utility function to load user library
+OpenCV_VPP::ImageProcessingCallback OpenCV_VPP::loadUserLibrary(const std::string &library_path) {
+    library_handle = dlopen(library_path.c_str(), RTLD_LAZY);
+    if (!library_handle) {
+        std::cerr << "Failed to load library: " << dlerror() << std::endl;
+        return nullptr;
+    }
+
+    // Use a function pointer type to retrieve the function
+    ImageProcessingFunctionPtr process_func = (ImageProcessingFunctionPtr)dlsym(library_handle, "process_image");
+    if (!process_func) {
+        std::cerr << "Failed to load function: " << dlerror() << std::endl;
+        dlclose(library_handle);
+        return nullptr;
+    }
+
+    // Wrap the function pointer in a std::function
+    return ImageProcessingCallback(process_func);
 }

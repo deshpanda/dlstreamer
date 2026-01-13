@@ -1,6 +1,6 @@
 #!/bin/bash
 # ==============================================================================
-# Copyright (C) 2024 Intel Corporation
+# Copyright (C) 2025 Intel Corporation
 #
 # SPDX-License-Identifier: MIT
 # ==============================================================================
@@ -17,13 +17,28 @@ else
   echo "MODELS_PATH: $MODELS_PATH"
 fi
 
+# List help message
+if [ "$1" = "--help" ] || [ "$1" = "-h" ]; then
+  echo "Usage: $0 [INPUT] [DEVICE_STREAM_12] [DEVICE_STREAM_34] [MODEL_1] [MODEL_2] [OUTPUT]"
+  echo ""
+  echo "Arguments:"
+  echo "  INPUT             - Input source (default: Pexels video URL)"
+  echo "  DEVICE_STREAM_12  - Device for stream 1 & 2 (default: NPU). Supported: CPU, GPU, NPU"
+  echo "  DEVICE_STREAM_34  - Device for stream 3 & 4 (default: GPU). Supported: CPU, GPU, NPU"
+  echo "  MODEL_1          - Model for stream 1 & 2 (default: yolov8s). Supported: yolox-tiny, yolox_s, yolov7, yolov8s, yolov9c"
+  echo "  MODEL_2          - Model for stream 3 & 4 (default: yolov8s). Supported: yolox-tiny, yolox_s, yolov7, yolov8s, yolov9c"
+  echo "  OUTPUT           - Output type (default: file). Supported: file, json"
+  echo ""
+  exit 0
+fi
+
 INPUT=${1:-"https://videos.pexels.com/video-files/1192116/1192116-sd_640_360_30fps.mp4"}
 DEVICE_STREAM_12=${2:-"NPU"}    # Supported values: CPU, GPU, NPU
 DEVICE_STREAM_34=${3:-"GPU"}    # Supported values: CPU, GPU, NPU
 MODEL_1=${4:-"yolov8s"}         # Supported values: yolox-tiny, yolox_s, yolov7, yolov8s, yolov9c
 MODEL_2=${5:-"yolov8s"}         # Supported values: yolox-tiny, yolox_s, yolov7, yolov8s, yolov9c
 OUTPUT=${6:-"file"}             # Supported values: file, json
-GSTVA=${7:-"VA"}                # Supported values: VA, VAAPI
+GSTVA="VA"
 
 cd "$(dirname "$0")"
 
@@ -91,16 +106,9 @@ if [ ! -f ${INPUT} ]; then
 fi
 SOURCE_ELEMENT="filesrc location=${INPUT}"
 
-### GSTVA , OUTPUT ##################################################################
-if [[ "$GSTVA" != "VA" ]] && [[ "$GSTVA" != "VAAPI" ]]; then 
-  echo "Error: Wrong value for GSTVA parameter."
-  echo "Valid values: VA, VAAPI"
-  exit
-fi
-
 ### STREAM 1 and 2 ###
 # CPU device
-DECODE_ELEMENT_STR12="decodebin"
+DECODE_ELEMENT_STR12="decodebin3"
 PREPROC_BACKEND_STR12="ie"
 # GPU , NPU device
 ## GST-VA ##
@@ -109,25 +117,15 @@ if [[ "$GSTVA" == "VA" ]]; then
     PREPROC_BACKEND_STR12="va-surface-sharing"
   fi
   if [[ "$DEVICE_STREAM_12" == "GPU" ]] || [[ "$DEVICE_STREAM_12" == "NPU" ]]; then
-    DECODE_ELEMENT_STR12="decodebin"
+    DECODE_ELEMENT_STR12="decodebin3"
     DECODE_ELEMENT_STR12+=" ! vapostproc ! video/x-raw(memory:VAMemory)"
-    PREPROC_BACKEND_STR12="${PREPROC_BACKEND_STR12} nireq=4 model-instance-id=inf0"
-  fi
-fi
-## GST-VAAPI ##
-if [[ "$GSTVA" == "VAAPI" ]]; then 
-  if [[ "$DEVICE_STREAM_12" == "GPU" ]]; then
-    PREPROC_BACKEND_STR12="vaapi-surface-sharing"
-  fi
-  if [[ "$DEVICE_STREAM_12" == "GPU" ]] || [[ "$DEVICE_STREAM_12" == "NPU" ]]; then
-    DECODE_ELEMENT_STR12+=" ! vaapipostproc ! video/x-raw(memory:VASurface)"
     PREPROC_BACKEND_STR12="${PREPROC_BACKEND_STR12} nireq=4 model-instance-id=inf0"
   fi
 fi
 
 ### STREAM 3 and 4 ###
 # CPU device
-DECODE_ELEMENT_STR34="decodebin"
+DECODE_ELEMENT_STR34="decodebin3"
 PREPROC_BACKEND_STR34="ie"
 # GPU , NPU device
 ## GST-VA ##
@@ -136,22 +134,13 @@ if [[ "$GSTVA" == "VA" ]]; then
     PREPROC_BACKEND_STR34="va-surface-sharing"
   fi
   if [[ "$DEVICE_STREAM_34" == "GPU" ]] || [[ "$DEVICE_STREAM_34" == "NPU" ]]; then
-    DECODE_ELEMENT_STR34="decodebin"
+    DECODE_ELEMENT_STR34="decodebin3"
     DECODE_ELEMENT_STR34+=" ! vapostproc ! video/x-raw(memory:VAMemory)"
     PREPROC_BACKEND_STR34="${PREPROC_BACKEND_STR34} nireq=4 model-instance-id=inf1"
   fi
 fi
-## GST-VAAPI ##
-if [[ "$GSTVA" == "VAAPI" ]]; then 
-  if [[ "$DEVICE_STREAM_34" == "GPU" ]]; then
-    PREPROC_BACKEND_STR34="vaapi-surface-sharing"
-  fi
-  if [[ "$DEVICE_STREAM_34" == "GPU" ]] || [[ "$DEVICE_STREAM_34" == "NPU" ]]; then
-    DECODE_ELEMENT_STR34+=" ! vaapipostproc ! video/x-raw(memory:VASurface)"
-    PREPROC_BACKEND_STR34="${PREPROC_BACKEND_STR34} nireq=4 model-instance-id=inf1"
-  fi
-fi
 
+## Output ##
 if [[ "$GSTVA" == "VA" ]]; then
   if [[ $(gst-inspect-1.0 va | grep vah264enc) ]]; then
     ENCODER="vah264enc"
@@ -161,26 +150,28 @@ if [[ "$GSTVA" == "VA" ]]; then
     echo "Error - VA-API H.264 encoder not found."
     exit
   fi
-  SINK_ELEMENT_BASE="gvawatermark ! videoconvertscale ! gvafpscounter ! ${ENCODER} ! h264parse ! mp4mux ! "
-fi
-if [[ "$GSTVA" == "VAAPI" ]]; then 
-  SINK_ELEMENT_BASE="gvawatermark ! videoconvertscale ! gvafpscounter ! vaapih264enc ! h264parse ! mp4mux ! "
+  SINK_ELEMENT_BASE="vapostproc ! gvawatermark ! gvafpscounter ! ${ENCODER} ! h264parse ! mp4mux ! "
 fi
 
 if [[ "$OUTPUT" == "file" ]]; then
-  FILE=$(basename "${INPUT%*.*}")
-  rm -f ${FILE}_*.mp4
-  SINK_ELEMENT_STR_1="${SINK_ELEMENT_BASE} filesink location=${FILE}_${GSTVA}_${DEVICE_STREAM_12}_1.mp4"
-  SINK_ELEMENT_STR_2="${SINK_ELEMENT_BASE} filesink location=${FILE}_${GSTVA}_${DEVICE_STREAM_12}_2.mp4"
-  SINK_ELEMENT_STR_3="${SINK_ELEMENT_BASE} filesink location=${FILE}_${GSTVA}_${DEVICE_STREAM_34}_3.mp4"
-  SINK_ELEMENT_STR_4="${SINK_ELEMENT_BASE} filesink location=${FILE}_${GSTVA}_${DEVICE_STREAM_34}_4.mp4"
+  rm -f multi_stream_*_1.mp4
+  rm -f multi_stream_*_2.mp4
+  rm -f multi_stream_*_3.mp4
+  rm -f multi_stream_*_4.mp4
+  SINK_ELEMENT_STR_1="${SINK_ELEMENT_BASE} filesink location=multi_stream_${GSTVA}_${DEVICE_STREAM_12}_1.mp4"
+  SINK_ELEMENT_STR_2="${SINK_ELEMENT_BASE} filesink location=multi_stream_${GSTVA}_${DEVICE_STREAM_12}_2.mp4"
+  SINK_ELEMENT_STR_3="${SINK_ELEMENT_BASE} filesink location=multi_stream_${GSTVA}_${DEVICE_STREAM_34}_3.mp4"
+  SINK_ELEMENT_STR_4="${SINK_ELEMENT_BASE} filesink location=multi_stream_${GSTVA}_${DEVICE_STREAM_34}_4.mp4"
 elif [[ "$OUTPUT" == "json" ]]; then
-  rm -f output.json
+  rm -f multi_stream_*_1.json
+  rm -f multi_stream_*_2.json
+  rm -f multi_stream_*_3.json
+  rm -f multi_stream_*_4.json
   SINK_ELEMENT_BASE="gvametaconvert add-tensor-data=true ! gvametapublish file-format=json-lines"
-  SINK_ELEMENT_STR_1="${SINK_ELEMENT_BASE} file-path=output_${GSTVA}_${DEVICE_STREAM_12}_1.json ! fakesink async=false"
-  SINK_ELEMENT_STR_2="${SINK_ELEMENT_BASE} file-path=output_${GSTVA}_${DEVICE_STREAM_12}_2.json ! fakesink async=false"
-  SINK_ELEMENT_STR_3="${SINK_ELEMENT_BASE} file-path=output_${GSTVA}_${DEVICE_STREAM_34}_3.json ! fakesink async=false"
-  SINK_ELEMENT_STR_4="${SINK_ELEMENT_BASE} file-path=output_${GSTVA}_${DEVICE_STREAM_34}_4.json ! fakesink async=false"
+  SINK_ELEMENT_STR_1="${SINK_ELEMENT_BASE} file-path=multi_stream_${GSTVA}_${DEVICE_STREAM_12}_1.json ! fakesink async=false"
+  SINK_ELEMENT_STR_2="${SINK_ELEMENT_BASE} file-path=multi_stream_${GSTVA}_${DEVICE_STREAM_12}_2.json ! fakesink async=false"
+  SINK_ELEMENT_STR_3="${SINK_ELEMENT_BASE} file-path=multi_stream_${GSTVA}_${DEVICE_STREAM_34}_3.json ! fakesink async=false"
+  SINK_ELEMENT_STR_4="${SINK_ELEMENT_BASE} file-path=multi_stream_${GSTVA}_${DEVICE_STREAM_34}_4.json ! fakesink async=false"
 else
   echo Error: Wrong value for SINK_ELEMENT parameter
   echo Valid values: "file" - render to file, "json" - write to output.json
@@ -207,22 +198,14 @@ ${PIPELINE_STREAM_4}"
 
 echo "${PIPELINE}"
 
-if [[ "$OUTPUT" == "json" ]]; then
-  # Remove each output stream file
-  eval "rm -f output_${GSTVA}_${DEVICE_STREAM_12}_1.json"
-  eval "rm -f output_${GSTVA}_${DEVICE_STREAM_12}_2.json"
-  eval "rm -f output_${GSTVA}_${DEVICE_STREAM_34}_3.json"
-  eval "rm -f output_${GSTVA}_${DEVICE_STREAM_34}_4.json"
-fi
-
 # Run main multi stream pipeline command
 ${PIPELINE}
 
 if [[ "$OUTPUT" == "json" ]]; then
-  FILE1="${PWD}/output_${GSTVA}_${DEVICE_STREAM_12}_1.json"
-  FILE2="${PWD}/output_${GSTVA}_${DEVICE_STREAM_12}_2.json"
-  FILE3="${PWD}/output_${GSTVA}_${DEVICE_STREAM_34}_3.json"
-  FILE4="${PWD}/output_${GSTVA}_${DEVICE_STREAM_34}_4.json"
+  FILE1="${PWD}/multi_stream_${GSTVA}_${DEVICE_STREAM_12}_1.json"
+  FILE2="${PWD}/multi_stream_${GSTVA}_${DEVICE_STREAM_12}_2.json"
+  FILE3="${PWD}/multi_stream_${GSTVA}_${DEVICE_STREAM_34}_3.json"
+  FILE4="${PWD}/multi_stream_${GSTVA}_${DEVICE_STREAM_34}_4.json"
 
   if [ -f ${FILE1} ] && [ -f ${FILE2} ] && [ -f ${FILE3} ] && [ -f ${FILE4} ]; then
     echo "Building output.json file ..."

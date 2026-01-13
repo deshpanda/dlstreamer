@@ -1,5 +1,5 @@
 /*******************************************************************************
- * Copyright (C) 2021-2024 Intel Corporation
+ * Copyright (C) 2021-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  ******************************************************************************/
@@ -21,11 +21,7 @@ G_BEGIN_DECLS
 typedef struct _GstGvaWatermark GstGvaWatermark;
 typedef struct _GstGvaWatermarkClass GstGvaWatermarkClass;
 
-enum WatermarkPath {
-    WatermarkPathNone = 0,
-    WatermarkPathVaVaapi,
-    WatermarkPathDirect,
-};
+enum WatermarkPath { WatermarkPathNone = 0, WatermarkPathVaVaapi, WatermarkPathDirect, WatermarkPathTransparent };
 
 struct _GstGvaWatermark {
     GstBin base_gvawatermark;
@@ -33,10 +29,15 @@ struct _GstGvaWatermark {
     GstPad *sinkpad;
     GstPad *srcpad;
     gchar *device;
+    gchar *displ_cfg;
     bool obb;
+    bool displ_avgfps;
+
+    bool use_watermarkimpl_only;
 
     enum WatermarkPath preferred_path;
     enum WatermarkPath active_path;
+    WatermarkPath block_pad_source;
     bool is_active_nv12;
     bool have_vaapi;
     bool have_va;

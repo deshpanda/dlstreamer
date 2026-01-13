@@ -1,5 +1,5 @@
 # ==============================================================================
-# Copyright (C) 2018-2024 Intel Corporation
+# Copyright (C) 2018-2025 Intel Corporation
 #
 # SPDX-License-Identifier: MIT
 # ==============================================================================
@@ -9,6 +9,7 @@ set (TARGET_NAME "image_inference_openvino")
 # FIXME: update macro below
 find_package(PkgConfig REQUIRED)
 find_package(OpenVINO REQUIRED Runtime)
+find_package(OpenCL REQUIRED)
 
 set(OpenVINO_MIN_VERSION "2024.0.0")
 if(${OpenVINO_VERSION} VERSION_LESS ${OpenVINO_MIN_VERSION})
@@ -44,7 +45,12 @@ PUBLIC
         utils
         logger
         dlstreamer_logger
+        OpenCL::OpenCL
 )
+
+if(WIN32)
+    target_link_libraries(${TARGET_NAME} PUBLIC d3d11)
+endif()
 
 if (${ENABLE_VAAPI} AND ${OpenVINO_VERSION} VERSION_GREATER_EQUAL "2023.3")
         add_definitions(-DENABLE_GPU_TILE_AFFINITY)

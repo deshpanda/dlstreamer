@@ -3,7 +3,6 @@ CMakeFiles
 CMakeFiles.txt.user
 CMakeScripts
 Testing
-Makefile
 cmake_install.cmake
 install_manifest.txt
 compile_commands.json
@@ -11,10 +10,13 @@ CTestTestfile.cmake
 build
 /build_afl
 /results
+.vs/
 .vscode
+.cache
 .idea
 _release
 cmake-build-*/
+vcpkg_installed/
 
 # Compiled Object files
 *.o
@@ -23,8 +25,6 @@ cmake-build-*/
 # Compiled Dynamic libraries
 *.so
 
-# Compiled Static libraries
-*.a
 # Python's Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[cod]

@@ -1,5 +1,5 @@
 /*******************************************************************************
- * Copyright (C) 2018-2022 Intel Corporation
+ * Copyright (C) 2018-2025 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  ******************************************************************************/
@@ -13,7 +13,10 @@
 #include "audioconverter.h"
 #endif
 #include "convert_tensor.h"
+#include "gva_json_meta.h"
 
+#include <gst/analytics/analytics.h>
+#include <gst/analytics/gstanalyticsclassificationmtd.h>
 #include <nlohmann/json.hpp>
 
 #include <iomanip>
@@ -25,6 +28,35 @@ GST_DEBUG_CATEGORY_STATIC(gst_json_converter_debug);
 #define GST_CAT_DEFAULT gst_json_converter_debug
 
 namespace {
+
+#define TIMESTAMP_LENGTH_BEFORE_MICROSECONDS 23
+#define TIMESTAMP_OFFSET_POSITION 26
+#define MICROSECONDS_TO_REMOVE 3
+
+// Function to cut part of a string
+gchar *cut_microseconds(const gchar *input) {
+    if (input == NULL)
+        return NULL;
+
+    // Calculate the length of the new string
+    size_t new_length = strlen(input) - MICROSECONDS_TO_REMOVE;
+
+    // Allocate memory for the new string
+    gchar *new_string = (gchar *)g_malloc(new_length + 1);
+    if (new_string == NULL)
+        return NULL;
+
+    // Copy the part before the microseconds
+    strncpy(new_string, input,
+            TIMESTAMP_LENGTH_BEFORE_MICROSECONDS); // Copy up to the first three digits of the microseconds
+    new_string[TIMESTAMP_LENGTH_BEFORE_MICROSECONDS] = '\0';
+
+    // Append the time zone offset
+    strcat(new_string, input + TIMESTAMP_OFFSET_POSITION);
+
+    return new_string;
+}
+
 /**
  * @return JSON object which contains parameters such as resolution, timestamp, source and tags.
  */
@@ -34,6 +66,9 @@ json get_frame_data(GstGvaMetaConvert *converter, GstBuffer *buffer) {
     json res = json::object();
     GstSegment converter_segment = converter->base_gvametaconvert.segment;
     GstClockTime timestamp = gst_segment_to_stream_time(&converter_segment, GST_FORMAT_TIME, buffer->pts);
+
+    GstVideoTimeCodeMeta *tc_meta = gst_buffer_get_video_time_code_meta(buffer);
+
     if (converter->info)
         res["resolution"] = json::object({{"width", converter->info->width}, {"height", converter->info->height}});
     if (converter->source)
@@ -42,6 +77,52 @@ json get_frame_data(GstGvaMetaConvert *converter, GstBuffer *buffer) {
         res["timestamp"] = timestamp;
     if (converter->tags && json::accept(converter->tags))
         res["tags"] = json::parse(converter->tags);
+    if (tc_meta) {
+        GstVideoTimeCode *vtc = gst_video_time_code_copy(&tc_meta->tc);
+        GDateTime *frame_date_time = gst_video_time_code_to_date_time(vtc);
+
+        // Format the datetime to ISO string with milliseconds
+        gchar *iso_string = NULL;
+        gchar *iso_string_millisec = NULL;
+        GDateTime *utc_datetime = NULL;
+
+        if (converter->timestamp_utc) {
+            utc_datetime = g_date_time_to_utc(frame_date_time); // Convert the GDateTime object to UTC
+            if (!utc_datetime)
+                GST_WARNING("Failed to convert datetime to UTC");
+            else {
+                g_date_time_unref(frame_date_time);
+                frame_date_time = utc_datetime;
+                // UTC mode: add 'Z' at the end
+                iso_string = g_date_time_format(frame_date_time, "%Y-%m-%dT%H:%M:%S.%fZ");
+            }
+        } else
+            // Non-UTC mode: include offset from UTC
+            iso_string = g_date_time_format(frame_date_time, "%Y-%m-%dT%H:%M:%S.%f:%z");
+
+        if (iso_string == NULL)
+            GST_WARNING("Failed to format the datetime to ISO string");
+        else {
+
+            if (!(converter->timestamp_microseconds)) {
+                iso_string_millisec = cut_microseconds(iso_string);
+                g_free(iso_string);
+                iso_string = iso_string_millisec;
+            }
+
+            // Store the formatted timestamp in the result
+            res["system_timestamp"] = iso_string;
+
+            // Free the allocated resources
+            g_free(iso_string);
+        }
+
+        if (frame_date_time)
+            g_date_time_unref(frame_date_time);
+
+        if (vtc)
+            gst_video_time_code_free(vtc);
+    }
     return res;
 }
 
@@ -55,8 +136,7 @@ json convert_roi_detection(GstGvaMetaConvert *converter, GstBuffer *buffer) {
     json res = json::array();
     GVA::VideoFrame video_frame(buffer, converter->info);
     for (GVA::RegionOfInterest &roi : video_frame.regions()) {
-        gint id = 0;
-        get_object_id(roi._meta(), &id);
+        gint id = roi.object_id();
 
         json jobject = json::object();
 
@@ -64,21 +144,28 @@ json convert_roi_detection(GstGvaMetaConvert *converter, GstBuffer *buffer) {
             jobject["tensors"] = json::array();
         }
 
-        jobject.push_back({"x", roi._meta()->x});
-        jobject.push_back({"y", roi._meta()->y});
-        jobject.push_back({"w", roi._meta()->w});
-        jobject.push_back({"h", roi._meta()->h});
+        auto rect = roi.rect();
+
+        jobject.push_back({"x", rect.x});
+        jobject.push_back({"y", rect.y});
+        jobject.push_back({"w", rect.w});
+        jobject.push_back({"h", rect.h});
         jobject.push_back({"region_id", roi.region_id()});
+
+        gint parent_id = roi.parent_id();
+        if (parent_id >= 0) {
+            jobject.push_back({"parent_id", parent_id});
+        }
 
         if (id != 0)
             jobject.push_back({"id", id});
 
-        const gchar *roi_type = g_quark_to_string(roi._meta()->roi_type);
+        const std::string roi_type = roi.label();
 
-        if (roi_type) {
+        if (!roi_type.empty()) {
             jobject.push_back({"roi_type", roi_type});
         }
-        for (GList *l = roi._meta()->params; l; l = g_list_next(l)) {
+        for (GList *l = roi.get_params(); l; l = g_list_next(l)) {
 
             GstStructure *s = GST_STRUCTURE(l->data);
             const gchar *s_name = gst_structure_get_name(s);
@@ -103,12 +190,29 @@ json convert_roi_detection(GstGvaMetaConvert *converter, GstBuffer *buffer) {
                         detection.push_back({"label_id", label_id});
                     }
 
-                    const gchar *label = g_quark_to_string(roi._meta()->roi_type);
+                    const std::string label = roi.label();
 
-                    if (label) {
+                    if (!label.empty()) {
                         detection.push_back({"label", label});
                     }
                     jobject.push_back(json::object_t::value_type("detection", detection));
+
+                    // Handle extra_params_json if present
+                    if (gst_structure_has_field(s, "extra_params_json")) {
+                        const GValue *val = gst_structure_get_value(s, "extra_params_json");
+                        if (G_VALUE_HOLDS_STRING(val)) {
+                            const gchar *json_str = g_value_get_string(val);
+                            if (json_str && strlen(json_str) > 0) {
+                                try {
+                                    jobject.push_back(
+                                        json::object_t::value_type("extra_params", nlohmann::json::parse(json_str)));
+                                } catch (const std::exception &e) {
+                                    GST_WARNING("Failed to parse extra_params_json: %s", e.what());
+                                    // Do not add the field if parsing fails
+                                }
+                            }
+                        }
+                    }
                 }
             } else {
                 char *label;
@@ -214,6 +318,93 @@ json convert_frame_classification(GstGvaMetaConvert *converter, GstBuffer *buffe
     return jobject;
 }
 
+/**
+ * @return JSON array which contains audio transcription classification metadata from buffer.
+ * This function specifically filters for transcription metadata from gvaaudiotranscribe element.
+ * It only processes classification metadata that:
+ * 1. Is not related to specific ROIs (not part of object detection)
+ * 2. Has a classification descriptor indicating it originates from gvaaudiotranscribe
+ * This function should only be called from the audio processing path.
+ */
+json convert_audio_transcription_classification(GstGvaMetaConvert *converter, GstBuffer *buffer) {
+    assert(converter && buffer && "Expected valid pointers GstGvaMetaConvert and GstBuffer");
+
+    json res = json::array();
+
+    // Get analytics relation metadata
+    GstAnalyticsRelationMeta *relation_meta = gst_buffer_get_analytics_relation_meta(buffer);
+    if (!relation_meta) {
+        return res; // No analytics metadata
+    }
+
+    // Helper lambda to check if a classification metadata is related to a transcription descriptor
+    auto is_transcription_metadata = [&](GstAnalyticsMtd mtd) -> bool {
+        // Check if this metadata has a RELATE_TO relationship with a transcription descriptor
+        gpointer state = nullptr;
+        GstAnalyticsClsMtd related_cls_mtd;
+
+        while (gst_analytics_relation_meta_get_direct_related(relation_meta, mtd.id, GST_ANALYTICS_REL_TYPE_RELATE_TO,
+                                                              gst_analytics_cls_mtd_get_mtd_type(), &state,
+                                                              &related_cls_mtd)) {
+            gsize length = gst_analytics_cls_mtd_get_length(&related_cls_mtd);
+
+            for (gsize i = 0; i < length; i++) {
+                gfloat confidence = gst_analytics_cls_mtd_get_level(&related_cls_mtd, i);
+                GQuark label_quark = gst_analytics_cls_mtd_get_quark(&related_cls_mtd, i);
+                const gchar *label = g_quark_to_string(label_quark);
+
+                // Check if this is a transcription descriptor (label="transcription", confidence=0.0)
+                if (label && g_strcmp0(label, "transcription") == 0 && confidence < 1e-6f) {
+                    return true;
+                }
+            }
+        }
+        return false;
+    };
+
+    // Helper lambda to check if a classification metadata is part of any ROI
+    auto is_part_of_roi = [&](GstAnalyticsMtd mtd) -> bool {
+        gpointer state = nullptr;
+        GstAnalyticsODMtd related_od_mtd;
+
+        // Check if this classification is part of any object detection (ROI)
+        return gst_analytics_relation_meta_get_direct_related(relation_meta, mtd.id, GST_ANALYTICS_REL_TYPE_IS_PART_OF,
+                                                              gst_analytics_od_mtd_get_mtd_type(), &state,
+                                                              &related_od_mtd);
+    };
+
+    // Iterate through all classification metadata
+    gpointer state = nullptr;
+    GstAnalyticsMtd mtd;
+    while (gst_analytics_relation_meta_iterate(relation_meta, &state, gst_analytics_cls_mtd_get_mtd_type(), &mtd)) {
+        GstAnalyticsClsMtd *cls_mtd = (GstAnalyticsClsMtd *)&mtd;
+        gsize length = gst_analytics_cls_mtd_get_length(cls_mtd);
+
+        // Check if this classification metadata should be included
+        // Include only if: 1) not part of any ROI AND 2) related to transcription descriptor
+        if (!is_part_of_roi(mtd) && is_transcription_metadata(mtd)) {
+            for (gsize i = 0; i < length; i++) {
+                gfloat confidence = gst_analytics_cls_mtd_get_level(cls_mtd, i);
+                GQuark label_quark = gst_analytics_cls_mtd_get_quark(cls_mtd, i);
+                const gchar *label = g_quark_to_string(label_quark);
+
+                json classification = json::object();
+                classification["label"] = label ? label : "";
+
+                // Only include confidence for actual results (non-zero confidence)
+                // Descriptors with 0.0 confidence are metadata markers - skip them
+                const gfloat epsilon = 1e-6f;
+                if (confidence > epsilon) {
+                    classification["confidence"] = confidence;
+                    res.push_back(classification);
+                }
+            }
+        }
+    }
+
+    return res;
+}
+
 } // namespace
 
 gboolean to_json(GstGvaMetaConvert *converter, GstBuffer *buffer) {
@@ -242,6 +433,7 @@ gboolean to_json(GstGvaMetaConvert *converter, GstBuffer *buffer) {
             if (!frame_classification.empty()) {
                 jframe_objects.push_back(frame_classification);
             }
+
             /* tensors section */
             json jframe_tensors;
             if (converter->add_tensor_data) {
@@ -270,7 +462,39 @@ gboolean to_json(GstGvaMetaConvert *converter, GstBuffer *buffer) {
         }
 #ifdef AUDIO
         else {
-            return convert_audio_meta_to_json(converter, buffer);
+            // For audio streams, handle transcription classification first, then fall back to traditional audio
+            // metadata
+            json audio_transcription_classification = convert_audio_transcription_classification(converter, buffer);
+            if (!audio_transcription_classification.empty()) {
+                // Create audio JSON message with analytics classification
+                json audio_frame = json::object();
+                GstSegment converter_segment = converter->base_gvametaconvert.segment;
+                GstClockTime timestamp = gst_segment_to_stream_time(&converter_segment, GST_FORMAT_TIME, buffer->pts);
+
+                if (converter->source)
+                    audio_frame["source"] = converter->source;
+                if (timestamp != G_MAXUINT64)
+                    audio_frame["timestamp"] = timestamp;
+                if (converter->tags && json::accept(converter->tags))
+                    audio_frame["tags"] = json::parse(converter->tags);
+
+                audio_frame["transcription"] = audio_transcription_classification;
+
+                std::string json_message = audio_frame.dump(converter->json_indent);
+
+                // Add as GVA JSON meta
+                GstGVAJSONMeta *json_meta = GST_GVA_JSON_META_ADD(buffer);
+                if (json_meta) {
+                    json_meta->message = g_strdup(json_message.c_str());
+                    GST_INFO_OBJECT(converter, "Audio JSON message: %s", json_message.c_str());
+                } else {
+                    GST_ERROR_OBJECT(converter, "Failed to add GVA JSON meta to audio buffer");
+                }
+                return TRUE;
+            } else {
+                // Fall back to traditional audio metadata conversion
+                return convert_audio_meta_to_json(converter, buffer);
+            }
         }
 #endif
     } catch (const std::exception &e) {

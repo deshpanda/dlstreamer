@@ -1,5 +1,5 @@
 /*******************************************************************************
- * Copyright (C) 2018-2021 Intel Corporation
+ * Copyright (C) 2018-2025 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  ******************************************************************************/
@@ -11,10 +11,18 @@
 
 namespace InferenceBackend {
 
-enum class ImagePreprocessorType : int { AUTO = 0, OPENCV, IE, VAAPI_SYSTEM, VAAPI_SURFACE_SHARING };
+enum class ImagePreprocessorType : int {
+    AUTO = 0,
+    OPENCV,
+    IE,
+    VAAPI_SYSTEM,
+    VAAPI_SURFACE_SHARING,
+    D3D11,
+    D3D11_SURFACE_SHARING
+};
 class ImagePreprocessor {
   public:
-    static ImagePreprocessor *Create(ImagePreprocessorType type);
+    static ImagePreprocessor *Create(ImagePreprocessorType type, const std::string custom_preproc_lib);
 
     virtual ~ImagePreprocessor() = default;
 
@@ -30,5 +38,5 @@ class ImagePreprocessor {
 
 Image ApplyCrop(const Image &src);
 
-ImagePreprocessor *CreatePreProcOpenCV();
+ImagePreprocessor *CreatePreProcOpenCV(const std::string custom_preproc_lib);
 } // namespace InferenceBackend

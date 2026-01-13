@@ -1,6 +1,6 @@
 #!/bin/bash
 # ==============================================================================
-# Copyright (C) 2018-2024 Intel Corporation
+# Copyright (C) 2018-2025 Intel Corporation
 #
 # SPDX-License-Identifier: MIT
 # ==============================================================================
@@ -12,6 +12,20 @@ if [ -z "${MODELS_PATH:-}" ]; then
   exit 1
 else 
   echo "MODELS_PATH: $MODELS_PATH"
+fi
+
+# List help message
+if [ "$1" = "--help" ] || [ "$1" = "-h" ]; then
+  echo "Usage: $0 [INPUT] [METHOD] [OUTPUT] [FORMAT] [TOPIC]"
+  echo ""
+  echo "Arguments:"
+  echo "  INPUT     - Input source (default: Pexels video URL)"
+  echo "  METHOD    - Metapublish method (default: file). Supported: file, kafka, mqtt"
+  echo "  OUTPUT    - Output destination (default: stdout for file, localhost:9092 for kafka, localhost:1883 for mqtt)"
+  echo "  FORMAT    - Output format (default: json for file, json-lines for kafka and mqtt). Supported: json, json-lines"
+  echo "  TOPIC     - Topic name (default: dlstreamer). Required for kafka and mqtt"
+  echo ""
+  exit 0
 fi
 
 INPUT=${1:-https://github.com/intel-iot-devkit/sample-videos/raw/master/head-pose-face-detection-female-and-male.mp4}
@@ -67,7 +81,7 @@ MODEL2_PATH="${MODELS_PATH:=.}"/intel/$MODEL2/$PRECISION/$MODEL2.xml
 MODEL2_PROC="$(dirname "$0")"/model_proc/$MODEL2.json
 
 PIPELINE="gst-launch-1.0 $SOURCE_ELEMENT ! \
-decodebin ! \
+decodebin3 ! \
 gvadetect model=$MODEL1_PATH device=$DEVICE ! queue ! \
 gvaclassify model=$MODEL2_PATH model-proc=$MODEL2_PROC device=$DEVICE ! queue ! \
 gvametaconvert json-indent=$JSON_INDENT ! \
